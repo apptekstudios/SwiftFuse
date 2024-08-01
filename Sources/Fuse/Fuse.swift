@@ -356,7 +356,7 @@ extension Fuse {
 	///   - text: The pattern string to search for
 	///   - aList: The list of `Fuseable` objects in which to search
 	/// - Returns: A list of `CollectionResult` objects
-	public func search<T: Fuseable>(_ text: String, in list: [T], maxResults: Int?) async throws -> [FusableSearchResult<T>] {
+	public func search<T: Fuseable>(_ text: String, in list: [T], maxResults: Int? = nil) async throws -> [FusableSearchResult<T>] {
 		try Task.checkCancellation()
 		let pattern = self.createPattern(from: text)
 		
