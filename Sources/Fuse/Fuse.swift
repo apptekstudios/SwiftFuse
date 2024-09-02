@@ -18,19 +18,23 @@ public class Fuse {
 	
 	public typealias Pattern = (text: String, len: Int, mask: Int, alphabet: [Character: Int])
 	
-	public typealias SearchResult = (index: Int, score: Double, ranges: [Range<String.Index>])
+	public struct StringSearchResult {
+		public var string: String
+		public var index: Int
+		public var result: ResultItem
+	}
 	
 	public struct FusableSearchResult<T> {
 		public var item: T
 		public var score: Double
 		public var resultsByKey: [String: ResultItem]
 		
-		public struct ResultItem {
-			public var score: Double
-			public var ranges: [Range<String.Index>]
-		}
+		
 	}
-	
+	public struct ResultItem {
+		public var score: Double
+		public var ranges: [Range<String.Index>]
+	}
 
 	
 	/// Creates a new instance of `Fuse`
@@ -81,7 +85,7 @@ public class Fuse {
 	///   - pattern: The pattern to search for. This is created by calling `createPattern`
 	///   - aString: The string in which to search for the pattern
 	/// - Returns: A tuple containing a `score` between `0.0` (exact match) and `1` (not a match), and `ranges` of the matched characters. If no match is found will return nil.
-	public func search(_ pattern: Pattern?, in aString: String) -> (score: Double, ranges: [Range<String.Index>])? {
+	public func search(_ pattern: Pattern?, in aString: String) -> ResultItem? {
 		guard let pattern = pattern else {
 			return nil
 		}
@@ -97,11 +101,11 @@ public class Fuse {
 			//Reduce all the word pattern matches and the full pattern match into a totals tuple
 			let results = wordPatterns.reduce(into: fullPatternResult) { (totalResult, pattern) in
 				let result = _search(pattern, in: aString)
-				totalResult = (totalResult.score + result.score, totalResult.ranges + result.ranges)
+				totalResult = .init(score: totalResult.score + result.score, ranges: totalResult.ranges + result.ranges)
 			}
 			
 			//Average the total score by dividing the summed scores by the number of word searches + the full string search. Also remove any range duplicates since we are searching full string and words individually.
-			let averagedResult = (score: results.score / Double(wordPatterns.count + 1), ranges: Array<Range<String.Index>>(Set<Range<String.Index>>(results.ranges)))
+			let averagedResult = ResultItem(score: results.score / Double(wordPatterns.count + 1), ranges: Array<Range<String.Index>>(Set<Range<String.Index>>(results.ranges)))
 			
 			//If the averaged score is 1 then there were no matches so return nil. Otherwise return the average result
 			return averagedResult.score == 1 ? nil : averagedResult
@@ -123,7 +127,7 @@ public class Fuse {
 	///   - pattern: The pattern to search for. This is created by calling `createPattern`
 	///   - aString: The string in which to search for the pattern
 	/// - Returns: A tuple containing a `score` between `0.0` (exact match) and `1` (not a match), and `ranges` of the matched characters. If no match is found will return a tuple with score of 1 and empty array of ranges.
-	private func _search(_ pattern: Pattern, in aString: String) -> (score: Double, ranges: [Range<String.Index>]) {
+	private func _search(_ pattern: Pattern, in aString: String) -> ResultItem {
 		
 		var text = aString
 		
@@ -135,7 +139,7 @@ public class Fuse {
 		
 		// Exact match
 		if (pattern.text == text) {
-			return (0, [text.startIndex ..< text.endIndex])
+			return .init(score: 0, ranges: [text.startIndex ..< text.endIndex])
 		}
 		
 		let location = self.location
@@ -275,7 +279,7 @@ public class Fuse {
 		
 		let ranges = Utilities.findRanges(matchMaskArr)
 	
-		return (score, ranges.map { aString.range(from: $0) })
+		return .init(score: score, ranges: ranges.map { aString.range(from: $0) })
 	}
 }
 
@@ -297,7 +301,7 @@ extension Fuse {
 	///   - text: the text string to search for.
 	///   - aString: The string in which to search for the pattern
 	/// - Returns: A tuple containing a `score` between `0.0` (exact match) and `1` (not a match), and `ranges` of the matched characters.
-	public func search(_ text: String, in aString: String) -> (score: Double, ranges: [Range<String.Index>])? {
+	public func search(_ text: String, in aString: String) -> ResultItem? {
 		return self.search(self.createPattern(from: text), in: aString)
 	}
 	
@@ -307,19 +311,19 @@ extension Fuse {
 	///   - text: The pattern string to search for
 	///   - aList: The list of string in which to search
 	/// - Returns: A tuple containing the `item` in which the match is found, the `score`, and the `ranges` of the matched characters
-	public func search(_ text: String, in aList: [String]) async throws -> [SearchResult] {
+	public func search<S: Sequence>(_ text: String, in list: S, maxResults: Int? = nil) async throws -> [StringSearchResult] where S.Element == String {
 		let pattern = self.createPattern(from: text)
 		
-		var items = [SearchResult]()
+		var items = [StringSearchResult]()
 		
-		for (index, item) in aList.enumerated() {
+		for (index, item) in list.enumerated() {
 			try Task.checkCancellation()
 			if let result = self.search(pattern, in: item) {
-				items.append((index, result.score, result.ranges))
+				items.append(.init(string: item, index: index, result: result))
 			}
 		}
 		
-		return items.sorted { $0.score < $1.score }
+		return items.sorted { $0.result.score < $1.result.score }
 	}
 	
 	/// Searches for a text pattern in an array of `Fuseable` objects.
@@ -367,7 +371,7 @@ extension Fuse {
 			var scores = [Double]()
 			var totalScore = 0.0
 			
-			var propertyResults = [String: FusableSearchResult<T>.ResultItem]()
+			var propertyResults = [String: ResultItem]()
 			
 			for (key, property) in item.fuseProperties {
 				if let result = self.search(pattern, in: property.value) {
