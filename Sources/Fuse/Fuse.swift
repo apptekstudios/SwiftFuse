@@ -57,6 +57,15 @@ public class Fuse<T: Sendable>: Sendable {
 		public var ranges: [Range<String.Index>]
 	}
 
+	/// Configuration for parallel search operations
+	internal struct SearchConfig: Sendable {
+		let location: Int
+		let distance: Int
+		let threshold: Double
+		let tokenize: Bool
+		let ignoreLocation: Bool
+	}
+
 	// MARK: - Initialization
 
 	/// Creates a new `Fuse` instance with a dataset of strings.
@@ -207,6 +216,9 @@ public class Fuse<T: Sendable>: Sendable {
 
 	// MARK: - Instance Search Methods
 
+	/// Minimum items to trigger parallel search (below this, sequential is faster)
+	private static let parallelThreshold = 100
+
 	/// Searches for a pattern in the indexed dataset.
 	///
 	/// If the index is still being built, this method will wait until it's ready.
@@ -222,12 +234,25 @@ public class Fuse<T: Sendable>: Sendable {
 		await awaitIndexReady()
 
 		guard let index = index else { return [] }
+		guard let pattern = createPattern(from: text) else { return [] }
 
-		let pattern = createPattern(from: text)
+		let items: [SearchResult]
+
+		// Use parallel search for large datasets
+		if index.items.count >= Self.parallelThreshold {
+			items = try await searchParallel(pattern: pattern, in: index)
+		} else {
+			items = searchSequential(pattern: pattern, in: index)
+		}
+
+		let sorted = items.sorted { $0.score < $1.score }
+		return maxResults.map { Array(sorted.prefix($0)) } ?? sorted
+	}
+
+	/// Sequential search for small datasets
+	private func searchSequential(pattern: Pattern, in index: FuseIndex<T>) -> [SearchResult] where T == String {
 		var items = [SearchResult]()
-
 		for indexedItem in index.items {
-			try Task.checkCancellation()
 			if let result = searchIndexed(pattern, in: indexedItem.properties[""]!) {
 				items.append(SearchResult(
 					item: indexedItem.item,
@@ -237,9 +262,45 @@ public class Fuse<T: Sendable>: Sendable {
 				))
 			}
 		}
+		return items
+	}
 
-		let sorted = items.sorted { $0.score < $1.score }
-		return maxResults.map { Array(sorted.prefix($0)) } ?? sorted
+	/// Parallel search for large datasets using TaskGroup
+	private func searchParallel(pattern: Pattern, in index: FuseIndex<T>) async throws -> [SearchResult] where T == String {
+		// Capture config for use in tasks
+		let config = SearchConfig(
+			location: location,
+			distance: distance,
+			threshold: threshold,
+			tokenize: tokenize,
+			ignoreLocation: ignoreLocation
+		)
+
+		return try await withThrowingTaskGroup(of: SearchResult?.self) { group in
+			for indexedItem in index.items {
+				let property = indexedItem.properties[""]!
+				group.addTask {
+					try Task.checkCancellation()
+					if let result = Self.searchProperty(pattern: pattern, property: property, config: config) {
+						return SearchResult(
+							item: indexedItem.item,
+							index: indexedItem.index,
+							score: result.score,
+							results: ["": result]
+						)
+					}
+					return nil
+				}
+			}
+
+			var results = [SearchResult]()
+			for try await result in group {
+				if let result = result {
+					results.append(result)
+				}
+			}
+			return results
+		}
 	}
 
 	/// Searches for a pattern in the indexed dataset.
@@ -257,14 +318,26 @@ public class Fuse<T: Sendable>: Sendable {
 		await awaitIndexReady()
 
 		guard let index = index else { return [] }
+		guard let pattern = createPattern(from: text) else { return [] }
 
-		try Task.checkCancellation()
-		let pattern = createPattern(from: text)
+		let collectionResult: [SearchResult]
 
+		// Use parallel search for large datasets
+		if index.items.count >= Self.parallelThreshold {
+			collectionResult = try await searchFuseableParallel(pattern: pattern, in: index)
+		} else {
+			collectionResult = searchFuseableSequential(pattern: pattern, in: index)
+		}
+
+		let sorted = collectionResult.sorted { $0.score < $1.score }
+		return maxResults.map { Array(sorted.prefix($0)) } ?? sorted
+	}
+
+	/// Sequential search for Fuseable items
+	private func searchFuseableSequential(pattern: Pattern, in index: FuseIndex<T>) -> [SearchResult] where T: Fuseable {
 		var collectionResult = [SearchResult]()
 
 		for indexedItem in index.items {
-			try Task.checkCancellation()
 			var scores = [Double]()
 			var totalScore = 0.0
 			var propertyResults = [String: ResultItem]()
@@ -291,8 +364,59 @@ public class Fuse<T: Sendable>: Sendable {
 			))
 		}
 
-		let sorted = collectionResult.sorted { $0.score < $1.score }
-		return maxResults.map { Array(sorted.prefix($0)) } ?? sorted
+		return collectionResult
+	}
+
+	/// Parallel search for Fuseable items using TaskGroup
+	private func searchFuseableParallel(pattern: Pattern, in index: FuseIndex<T>) async throws -> [SearchResult] where T: Fuseable {
+		// Capture config for use in tasks
+		let config = SearchConfig(
+			location: location,
+			distance: distance,
+			threshold: threshold,
+			tokenize: tokenize,
+			ignoreLocation: ignoreLocation
+		)
+
+		return try await withThrowingTaskGroup(of: SearchResult?.self) { group in
+			for indexedItem in index.items {
+				group.addTask {
+					try Task.checkCancellation()
+					var scores = [Double]()
+					var totalScore = 0.0
+					var propertyResults = [String: ResultItem]()
+
+					for (key, property) in indexedItem.properties {
+						if let result = Self.searchProperty(pattern: pattern, property: property, config: config) {
+							let weight = property.weight == 1 ? 1 : 1 - property.weight
+							let score = (result.score == 0 && weight == 1 ? 0.001 : result.score) * weight
+							totalScore += score
+							scores.append(score)
+							propertyResults[key] = ResultItem(score: score, ranges: result.ranges)
+						}
+					}
+
+					guard !scores.isEmpty else {
+						return nil
+					}
+
+					return SearchResult(
+						item: indexedItem.item,
+						index: indexedItem.index,
+						score: totalScore / Double(scores.count),
+						results: propertyResults
+					)
+				}
+			}
+
+			var results = [SearchResult]()
+			for try await result in group {
+				if let result = result {
+					results.append(result)
+				}
+			}
+			return results
+		}
 	}
 
 	// MARK: - Pattern Creation
@@ -428,6 +552,176 @@ public class Fuse<T: Sendable>: Sendable {
 			}
 
 			// O(1) character access using array instead of String.Index traversal
+			for j in (start...finish).reversed() {
+				let currentLocation = j - 1
+
+				let charMatch: Int = {
+					if currentLocation < textLength {
+						let char = characters[currentLocation]
+						if let result = pattern.alphabet[char] {
+							return result
+						}
+					}
+					return 0
+				}()
+
+				if charMatch != 0 {
+					matchMaskArr[currentLocation] = 1
+				}
+
+				bitArr[j] = ((bitArr[j + 1] << 1) | 1) & charMatch
+
+				if i > 0 {
+					bitArr[j] |= (((lastBitArr[j + 1] | lastBitArr[j]) << 1) | 1) | lastBitArr[j + 1]
+				}
+
+				if (bitArr[j] & pattern.mask) != 0 {
+					score = Utilities.calculateScore(pattern.len, e: i, x: location, loc: currentLocation, distance: distance, ignoreLocation: ignoreLocation)
+
+					if score <= threshold {
+						threshold = score
+						bestLocation = currentLocation
+
+						guard let bestLocation = bestLocation else {
+							break
+						}
+
+						if bestLocation > location {
+							start = max(1, 2 * location - bestLocation)
+						} else {
+							break
+						}
+					}
+				}
+			}
+
+			if Utilities.calculateScore(pattern.len, e: i + 1, x: location, loc: location, distance: distance, ignoreLocation: ignoreLocation) > threshold {
+				break
+			}
+
+			lastBitArr = bitArr
+		}
+
+		let ranges = Utilities.findRanges(matchMaskArr)
+
+		return ResultItem(score: score, ranges: ranges.map { originalString.range(from: $0) })
+	}
+
+	// MARK: - Nonisolated Search for Parallel Execution
+
+	/// Static search method for parallel execution (nonisolated to run in TaskGroup)
+	nonisolated static func searchProperty<U>(
+		pattern: Pattern,
+		property: FuseIndex<U>.IndexedProperty,
+		config: SearchConfig
+	) -> ResultItem? {
+		// Pre-filter: check if text contains enough pattern characters to possibly match
+		let patternChars = Set(pattern.text)
+		let matchingChars = patternChars.intersection(property.characterSet)
+		let minRequiredChars = max(1, patternChars.count / 2)
+		if matchingChars.count < minRequiredChars {
+			return nil
+		}
+
+		if config.tokenize {
+			let wordPatterns = pattern.text.split(separator: " ").compactMap { word -> Pattern? in
+				let patternStr = String(config.ignoreLocation ? word : word.lowercased()).prefix(Int.bitWidth - 1)
+				let len = patternStr.count
+				guard len > 0 else { return nil }
+				return (
+					text: String(patternStr),
+					len: len,
+					mask: 1 << (len - 1),
+					alphabet: Utilities.calculatePatternAlphabet(String(patternStr))
+				)
+			}
+			let fullPatternResult = searchStatic(pattern, in: property.original, characters: property.characters, textLength: property.length, config: config)
+
+			let results = wordPatterns.reduce(into: fullPatternResult) { totalResult, wordPattern in
+				let result = searchStatic(wordPattern, in: property.original, characters: property.characters, textLength: property.length, config: config)
+				totalResult = ResultItem(score: totalResult.score + result.score, ranges: totalResult.ranges + result.ranges)
+			}
+
+			let averagedResult = ResultItem(
+				score: results.score / Double(wordPatterns.count + 1),
+				ranges: Array(Set(results.ranges))
+			)
+			return averagedResult.score == 1 ? nil : averagedResult
+		} else {
+			let result = searchStatic(pattern, in: property.original, characters: property.characters, textLength: property.length, config: config)
+			return result.score == 1 ? nil : result
+		}
+	}
+
+	/// Static Bitap algorithm implementation for parallel execution
+	nonisolated private static func searchStatic(_ pattern: Pattern, in originalString: String, characters: [Character], textLength: Int, config: SearchConfig) -> ResultItem {
+		// Create normalized string for substring search
+		let normalizedText = String(characters)
+
+		// Exact match
+		if pattern.text == normalizedText {
+			return ResultItem(score: 0, ranges: [originalString.startIndex ..< originalString.endIndex])
+		}
+
+		let location = config.location
+		let distance = config.distance
+		var threshold = config.threshold
+		let ignoreLocation = config.ignoreLocation
+
+		var bestLocation: Int? = {
+			if let index = normalizedText.index(of: pattern.text, startingFrom: location) {
+				return normalizedText.distance(from: normalizedText.startIndex, to: index)
+			}
+			return nil
+		}()
+
+		var matchMaskArr = [Int](repeating: 0, count: textLength)
+
+		var index = normalizedText.index(of: pattern.text, startingFrom: bestLocation)
+		while index != nil {
+			let i = normalizedText.distance(from: normalizedText.startIndex, to: index!)
+			let score = Utilities.calculateScore(pattern.len, e: 0, x: i, loc: location, distance: distance, ignoreLocation: ignoreLocation)
+			threshold = min(threshold, score)
+			bestLocation = i + pattern.len
+			index = normalizedText.index(of: pattern.text, startingFrom: bestLocation)
+
+			var idx = 0
+			while idx < pattern.len {
+				matchMaskArr[i + idx] = 1
+				idx += 1
+			}
+		}
+
+		bestLocation = nil
+
+		var score = 1.0
+		var binMax: Int = pattern.len + textLength
+		var lastBitArr = [Int]()
+
+		for i in 0..<pattern.len {
+			var binMin = 0
+			var binMid = binMax
+
+			while binMin < binMid {
+				if Utilities.calculateScore(pattern.len, e: i, x: location, loc: location + binMid, distance: distance, ignoreLocation: ignoreLocation) <= threshold {
+					binMin = binMid
+				} else {
+					binMax = binMid
+				}
+				binMid = ((binMax - binMin) / 2) + binMin
+			}
+
+			binMax = binMid
+			var start = max(1, location - binMid + 1)
+			let finish = min(location + binMid, textLength) + pattern.len
+
+			var bitArr = [Int](repeating: 0, count: finish + 2)
+			bitArr[finish + 1] = (1 << i) - 1
+
+			if start > finish {
+				continue
+			}
+
 			for j in (start...finish).reversed() {
 				let currentLocation = j - 1
 
