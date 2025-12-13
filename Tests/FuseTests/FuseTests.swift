@@ -125,6 +125,56 @@ final class FuseTests: XCTestCase {
 		let results = try await fuse.search("Name 500")
 		XCTAssertFalse(results.isEmpty)
 	}
+
+	// MARK: - Ignore Location
+
+	func testIgnoreLocation() async throws {
+		// Pattern appears at different positions in these strings
+		let strings = [
+			"test at start",           // "test" at position 0
+			"this is a test string",   // "test" at position 10
+			"end test"                 // "test" at position 4
+		]
+
+		// With ignoreLocation: false (default), location affects score
+		// Default location=0 means matches near the start score better
+		let fuseWithLocation = Fuse(data: strings, location: 0)
+		let resultsWithLocation = try await fuseWithLocation.search("test")
+
+		// With ignoreLocation: true, only match accuracy matters
+		// All exact matches should have the same score
+		let fuseIgnoreLocation = Fuse(data: strings, ignoreLocation: true)
+		let resultsIgnoreLocation = try await fuseIgnoreLocation.search("test")
+
+		// When ignoring location, all exact matches of "test" should have score 0
+		for result in resultsIgnoreLocation {
+			XCTAssertEqual(result.score, 0, "With ignoreLocation, exact match should have score 0")
+		}
+
+		// With location considered, scores should vary based on position
+		let scoresWithLocation = resultsWithLocation.map { $0.score }
+		let scoresIgnoreLocation = resultsIgnoreLocation.map { $0.score }
+
+		print("Scores with location: \(scoresWithLocation)")
+		print("Scores ignoring location: \(scoresIgnoreLocation)")
+
+		// The scores with location should not all be equal (unless by coincidence)
+		// but scores ignoring location should all be 0 for exact matches
+		XCTAssertTrue(scoresIgnoreLocation.allSatisfy { $0 == 0 })
+	}
+
+	func testIgnoreLocationStatic() async throws {
+		let names = ["prefix_john", "john_suffix", "mid_john_dle"]
+
+		// Static search with ignoreLocation
+		let results = try await Fuse.search("john", in: names, ignoreLocation: true)
+
+		// All should match with score 0 (exact substring matches)
+		XCTAssertEqual(results.count, 3)
+		for result in results {
+			XCTAssertEqual(result.score, 0)
+		}
+	}
 }
 
 

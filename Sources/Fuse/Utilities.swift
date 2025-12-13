@@ -9,10 +9,11 @@ enum Utilities {
 	/// - Parameter e: Number of errors in match.
 	/// - Parameter x: Location of match.
 	/// - Parameter loc: Expected location of match.
-	/// - Parameter scoreTextLength: Coerced version of text's length.
+	/// - Parameter distance: How much location affects the score.
+	/// - Parameter ignoreLocation: When true, score is based only on match accuracy.
 	/// - Returns: Overall score for match (0.0 = good, 1.0 = bad).
-	static func calculateScore(_ pattern: String, e: Int, x: Int, loc: Int, distance: Int) -> Double {
-		return calculateScore(pattern.count, e: e, x: x, loc: loc, distance: distance)
+	static func calculateScore(_ pattern: String, e: Int, x: Int, loc: Int, distance: Int, ignoreLocation: Bool = false) -> Double {
+		return calculateScore(pattern.count, e: e, x: x, loc: loc, distance: distance, ignoreLocation: ignoreLocation)
 	}
 
 	/// Computes the score for a match with `e` errors and `x` location.
@@ -21,15 +22,21 @@ enum Utilities {
 	/// - Parameter e: Number of errors in match.
 	/// - Parameter x: Location of match.
 	/// - Parameter loc: Expected location of match.
-	/// - Parameter scoreTextLength: Coerced version of text's length.
+	/// - Parameter distance: How much location affects the score.
+	/// - Parameter ignoreLocation: When true, score is based only on match accuracy.
 	/// - Returns: Overall score for match (0.0 = good, 1.0 = bad).
-	static func calculateScore(_ patternLength: Int, e: Int, x: Int, loc: Int, distance: Int) -> Double {
+	static func calculateScore(_ patternLength: Int, e: Int, x: Int, loc: Int, distance: Int, ignoreLocation: Bool = false) -> Double {
 		let accuracy = Double(e) / Double(patternLength)
+
+		if ignoreLocation {
+			return accuracy
+		}
+
 		let proximity = abs(x - loc)
-		if (distance == 0) {
+		if distance == 0 {
 			return Double(proximity != 0 ? 1 : accuracy)
 		}
-		return Double(accuracy) + (Double(proximity) / Double(distance))
+		return accuracy + (Double(proximity) / Double(distance))
 	}
 
 	/// Initializes the alphabet for the Bitap algorithm

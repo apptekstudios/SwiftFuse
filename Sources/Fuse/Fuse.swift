@@ -32,6 +32,7 @@ public class Fuse<T: Sendable>: Sendable {
 	private let maxPatternLength: Int
 	private let isCaseSensitive: Bool
 	private let tokenize: Bool
+	private let ignoreLocation: Bool
 
 	/// The preprocessed index for fast searches (nil until indexing completes)
 	private var index: FuseIndex<T>?
@@ -71,6 +72,7 @@ public class Fuse<T: Sendable>: Sendable {
 	///   - maxPatternLength: The maximum valid pattern length. Defaults to `32`
 	///   - isCaseSensitive: Indicates whether comparisons should be case sensitive. Defaults to `false`
 	///   - tokenize: When true, searches individual words and the full string. Defaults to `false`
+	///   - ignoreLocation: When true, search will ignore where in the string the pattern is expected to be found. Defaults to `false`
 	public init(
 		data: [String],
 		location: Int = 0,
@@ -78,7 +80,8 @@ public class Fuse<T: Sendable>: Sendable {
 		threshold: Double = 0.6,
 		maxPatternLength: Int = 32,
 		isCaseSensitive: Bool = false,
-		tokenize: Bool = false
+		tokenize: Bool = false,
+		ignoreLocation: Bool = false
 	) where T == String {
 		self.location = location
 		self.distance = distance
@@ -86,6 +89,7 @@ public class Fuse<T: Sendable>: Sendable {
 		self.maxPatternLength = maxPatternLength
 		self.isCaseSensitive = isCaseSensitive
 		self.tokenize = tokenize
+		self.ignoreLocation = ignoreLocation
 
 		// Build index asynchronously in background
 		Task { [weak self] in
@@ -106,6 +110,7 @@ public class Fuse<T: Sendable>: Sendable {
 	///   - maxPatternLength: The maximum valid pattern length. Defaults to `32`
 	///   - isCaseSensitive: Indicates whether comparisons should be case sensitive. Defaults to `false`
 	///   - tokenize: When true, searches individual words and the full string. Defaults to `false`
+	///   - ignoreLocation: When true, search will ignore where in the string the pattern is expected to be found. Defaults to `false`
 	public init(
 		data: [T],
 		location: Int = 0,
@@ -113,7 +118,8 @@ public class Fuse<T: Sendable>: Sendable {
 		threshold: Double = 0.6,
 		maxPatternLength: Int = 32,
 		isCaseSensitive: Bool = false,
-		tokenize: Bool = false
+		tokenize: Bool = false,
+		ignoreLocation: Bool = false
 	) where T: Fuseable {
 		self.location = location
 		self.distance = distance
@@ -121,6 +127,7 @@ public class Fuse<T: Sendable>: Sendable {
 		self.maxPatternLength = maxPatternLength
 		self.isCaseSensitive = isCaseSensitive
 		self.tokenize = tokenize
+		self.ignoreLocation = ignoreLocation
 
 		// Build index asynchronously in background
 		Task { [weak self] in
@@ -352,7 +359,7 @@ public class Fuse<T: Sendable>: Sendable {
 		var index = text.index(of: pattern.text, startingFrom: bestLocation)
 		while index != nil {
 			let i = text.distance(from: text.startIndex, to: index!)
-			let score = Utilities.calculateScore(pattern.len, e: 0, x: i, loc: location, distance: distance)
+			let score = Utilities.calculateScore(pattern.len, e: 0, x: i, loc: location, distance: distance, ignoreLocation: ignoreLocation)
 			threshold = min(threshold, score)
 			bestLocation = i + pattern.len
 			index = text.index(of: pattern.text, startingFrom: bestLocation)
@@ -379,7 +386,7 @@ public class Fuse<T: Sendable>: Sendable {
 			var binMid = binMax
 
 			while binMin < binMid {
-				if Utilities.calculateScore(pattern.len, e: i, x: location, loc: location + binMid, distance: distance) <= threshold {
+				if Utilities.calculateScore(pattern.len, e: i, x: location, loc: location + binMid, distance: distance, ignoreLocation: ignoreLocation) <= threshold {
 					binMin = binMid
 				} else {
 					binMax = binMid
@@ -425,7 +432,7 @@ public class Fuse<T: Sendable>: Sendable {
 				}
 
 				if (bitArr[j] & pattern.mask) != 0 {
-					score = Utilities.calculateScore(pattern.len, e: i, x: location, loc: currentLocation, distance: distance)
+					score = Utilities.calculateScore(pattern.len, e: i, x: location, loc: currentLocation, distance: distance, ignoreLocation: ignoreLocation)
 
 					if score <= threshold {
 						threshold = score
@@ -444,7 +451,7 @@ public class Fuse<T: Sendable>: Sendable {
 				}
 			}
 
-			if Utilities.calculateScore(pattern.len, e: i + 1, x: location, loc: location, distance: distance) > threshold {
+			if Utilities.calculateScore(pattern.len, e: i + 1, x: location, loc: location, distance: distance, ignoreLocation: ignoreLocation) > threshold {
 				break
 			}
 
@@ -477,6 +484,7 @@ extension Fuse {
 	///   - threshold: At what point does the match algorithm give up. Defaults to `0.6`
 	///   - isCaseSensitive: Indicates whether comparisons should be case sensitive. Defaults to `false`
 	///   - tokenize: When true, searches individual words and the full string. Defaults to `false`
+	///   - ignoreLocation: When true, score is based only on match accuracy. Defaults to `false`
 	/// - Returns: An array of `SearchResult` sorted by score (best matches first)
 	public static func search(
 		_ text: String,
@@ -486,7 +494,8 @@ extension Fuse {
 		distance: Int = 100,
 		threshold: Double = 0.6,
 		isCaseSensitive: Bool = false,
-		tokenize: Bool = false
+		tokenize: Bool = false,
+		ignoreLocation: Bool = false
 	) async throws -> [Fuse<String>.SearchResult] {
 		let fuse = Fuse<String>(
 			data: data,
@@ -494,7 +503,8 @@ extension Fuse {
 			distance: distance,
 			threshold: threshold,
 			isCaseSensitive: isCaseSensitive,
-			tokenize: tokenize
+			tokenize: tokenize,
+			ignoreLocation: ignoreLocation
 		)
 		return try await fuse.search(text, maxResults: maxResults)
 	}
@@ -515,6 +525,7 @@ extension Fuse {
 	///   - threshold: At what point does the match algorithm give up. Defaults to `0.6`
 	///   - isCaseSensitive: Indicates whether comparisons should be case sensitive. Defaults to `false`
 	///   - tokenize: When true, searches individual words and the full string. Defaults to `false`
+	///   - ignoreLocation: When true, score is based only on match accuracy. Defaults to `false`
 	/// - Returns: An array of `SearchResult` sorted by score (best matches first)
 	public static func search<U: Fuseable & Sendable>(
 		_ text: String,
@@ -524,7 +535,8 @@ extension Fuse {
 		distance: Int = 100,
 		threshold: Double = 0.6,
 		isCaseSensitive: Bool = false,
-		tokenize: Bool = false
+		tokenize: Bool = false,
+		ignoreLocation: Bool = false
 	) async throws -> [Fuse<U>.SearchResult] {
 		let fuse = Fuse<U>(
 			data: data,
@@ -532,7 +544,8 @@ extension Fuse {
 			distance: distance,
 			threshold: threshold,
 			isCaseSensitive: isCaseSensitive,
-			tokenize: tokenize
+			tokenize: tokenize,
+			ignoreLocation: ignoreLocation
 		)
 		return try await fuse.search(text, maxResults: maxResults)
 	}
