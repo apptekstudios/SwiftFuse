@@ -12,11 +12,11 @@ public actor FuseActor {
 /// ## Creating an Instance with Data (Recommended for repeated searches)
 ///
 /// When you need to search the same dataset multiple times, create a `Fuse` instance with your data.
-/// This pre-indexes the data for faster searches:
+/// The index is built asynchronously in the background - init returns immediately:
 ///
-///     let fuse = Fuse(data: books)
-///     let results1 = try await fuse.search("tolkien")
-///     let results2 = try await fuse.search("orwell")
+///     let fuse = Fuse(data: books)  // Returns immediately, indexing in background
+///     let results1 = try await fuse.search("tolkien")  // Waits for index if needed
+///     let results2 = try await fuse.search("orwell")   // Index ready, instant
 ///
 /// ## One-Time Searches (Static Method)
 ///
@@ -25,27 +25,33 @@ public actor FuseActor {
 ///     let results = try await Fuse.search("tolkien", in: books)
 ///
 @FuseActor
-public class Fuse<T> {
-	private var location: Int
-	private var distance: Int
-	private var threshold: Double
-	private var maxPatternLength: Int
-	private var isCaseSensitive: Bool
-	private var tokenize: Bool
+public class Fuse<T: Sendable>: Sendable {
+	private let location: Int
+	private let distance: Int
+	private let threshold: Double
+	private let maxPatternLength: Int
+	private let isCaseSensitive: Bool
+	private let tokenize: Bool
 
-	/// The preprocessed index for fast searches
-	private let index: FuseIndex<T>
+	/// The preprocessed index for fast searches (nil until indexing completes)
+	private var index: FuseIndex<T>?
+
+	/// Continuations waiting for the index to be ready
+	private var waiters: [CheckedContinuation<Void, Never>] = []
+
+	/// Whether indexing has completed
+	private var isIndexReady: Bool = false
 
 	public typealias Pattern = (text: String, len: Int, mask: Int, alphabet: [Character: Int])
 
-	public struct SearchResult {
+	public struct SearchResult: Sendable {
 		public var item: T
 		public var index: Int
 		public var score: Double
 		public var results: [String: ResultItem]
 	}
 
-	public struct ResultItem {
+	public struct ResultItem: Sendable {
 		public var score: Double
 		public var ranges: [Range<String.Index>]
 	}
@@ -54,7 +60,8 @@ public class Fuse<T> {
 
 	/// Creates a new `Fuse` instance with a dataset of strings.
 	///
-	/// The data is indexed at initialization for fast repeated searches.
+	/// The index is built asynchronously in the background. Init returns immediately.
+	/// Search calls will automatically wait for the index to be ready.
 	///
 	/// - Parameters:
 	///   - data: The array of strings to search
@@ -80,20 +87,16 @@ public class Fuse<T> {
 		self.isCaseSensitive = isCaseSensitive
 		self.tokenize = tokenize
 
-		// Create index from data
-		let indexedItems = data.enumerated().map { idx, item in
-			FuseIndex<String>.IndexedItem(
-				item: item,
-				index: idx,
-				properties: ["": (original: item, normalized: isCaseSensitive ? item : item.lowercased(), weight: 1.0)]
-			)
+		// Build index asynchronously in background
+		Task { [weak self] in
+			await self?.buildStringIndex(from: data)
 		}
-		self.index = FuseIndex(items: indexedItems, isCaseSensitive: isCaseSensitive) as! FuseIndex<T>
 	}
 
 	/// Creates a new `Fuse` instance with a dataset of `Fuseable` objects.
 	///
-	/// The data is indexed at initialization for fast repeated searches.
+	/// The index is built asynchronously in the background. Init returns immediately.
+	/// Search calls will automatically wait for the index to be ready.
 	///
 	/// - Parameters:
 	///   - data: The array of `Fuseable` objects to search
@@ -119,7 +122,27 @@ public class Fuse<T> {
 		self.isCaseSensitive = isCaseSensitive
 		self.tokenize = tokenize
 
-		// Create index from data
+		// Build index asynchronously in background
+		Task { [weak self] in
+			await self?.buildFuseableIndex(from: data)
+		}
+	}
+
+	// MARK: - Background Index Building
+
+	private func buildStringIndex(from data: [String]) {
+		let indexedItems = data.enumerated().map { idx, item in
+			FuseIndex<String>.IndexedItem(
+				item: item,
+				index: idx,
+				properties: ["": (original: item, normalized: isCaseSensitive ? item : item.lowercased(), weight: 1.0)]
+			)
+		}
+		self.index = FuseIndex(items: indexedItems, isCaseSensitive: isCaseSensitive) as? FuseIndex<T>
+		markIndexReady()
+	}
+
+	private func buildFuseableIndex<U: Fuseable>(from data: [U]) where T == U {
 		let indexedItems = data.enumerated().map { idx, item in
 			var properties = [String: (original: String, normalized: String, weight: Double)]()
 			for (key, property) in item.fuseProperties {
@@ -136,22 +159,50 @@ public class Fuse<T> {
 			)
 		}
 		self.index = FuseIndex(items: indexedItems, isCaseSensitive: isCaseSensitive)
+		markIndexReady()
+	}
+
+	private func markIndexReady() {
+		isIndexReady = true
+		// Resume all waiting continuations
+		for waiter in waiters {
+			waiter.resume()
+		}
+		waiters.removeAll()
+	}
+
+	/// Waits for the index to be ready
+	private func awaitIndexReady() async {
+		if isIndexReady { return }
+
+		await withCheckedContinuation { continuation in
+			if isIndexReady {
+				continuation.resume()
+			} else {
+				waiters.append(continuation)
+			}
+		}
 	}
 
 	// MARK: - Instance Search Methods
 
 	/// Searches for a pattern in the indexed dataset.
 	///
-	///     let fuse = Fuse(data: books)
-	///     let results = try await fuse.search("tolkien")
+	/// If the index is still being built, this method will wait until it's ready.
+	///
+	///     let fuse = Fuse(data: books)  // Returns immediately
+	///     let results = try await fuse.search("tolkien")  // Waits for index if needed
 	///
 	/// - Parameters:
 	///   - text: The pattern string to search for
 	///   - maxResults: Optional limit on number of results returned
 	/// - Returns: An array of `SearchResult` sorted by score (best matches first)
 	public func search(_ text: String, maxResults: Int? = nil) async throws -> [SearchResult] where T == String {
-		let pattern = createPattern(from: text)
+		await awaitIndexReady()
 
+		guard let index = index else { return [] }
+
+		let pattern = createPattern(from: text)
 		var items = [SearchResult]()
 
 		for indexedItem in index.items {
@@ -172,14 +223,20 @@ public class Fuse<T> {
 
 	/// Searches for a pattern in the indexed dataset.
 	///
-	///     let fuse = Fuse(data: books)
-	///     let results = try await fuse.search("tolkien")
+	/// If the index is still being built, this method will wait until it's ready.
+	///
+	///     let fuse = Fuse(data: books)  // Returns immediately
+	///     let results = try await fuse.search("tolkien")  // Waits for index if needed
 	///
 	/// - Parameters:
 	///   - text: The pattern string to search for
 	///   - maxResults: Optional limit on number of results returned
 	/// - Returns: An array of `SearchResult` sorted by score (best matches first)
 	public func search(_ text: String, maxResults: Int? = nil) async throws -> [SearchResult] where T: Fuseable {
+		await awaitIndexReady()
+
+		guard let index = index else { return [] }
+
 		try Task.checkCancellation()
 		let pattern = createPattern(from: text)
 
@@ -459,7 +516,7 @@ extension Fuse {
 	///   - isCaseSensitive: Indicates whether comparisons should be case sensitive. Defaults to `false`
 	///   - tokenize: When true, searches individual words and the full string. Defaults to `false`
 	/// - Returns: An array of `SearchResult` sorted by score (best matches first)
-	public static func search<U: Fuseable>(
+	public static func search<U: Fuseable & Sendable>(
 		_ text: String,
 		in data: [U],
 		maxResults: Int? = nil,

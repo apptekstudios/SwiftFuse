@@ -6,9 +6,9 @@ import Foundation
 /// This struct is used internally by `Fuse` to store pre-indexed data for fast searches.
 /// Users don't interact with this directly - it's created automatically when you initialize
 /// a `Fuse` instance with data.
-public struct FuseIndex<T> {
+public struct FuseIndex<T: Sendable>: Sendable {
 	/// A single indexed item with preprocessed searchable text
-	public struct IndexedItem {
+	public struct IndexedItem: Sendable {
 		/// The original item
 		public let item: T
 		/// The original index in the source collection

@@ -11,9 +11,10 @@ final class FuseTests: XCTestCase {
 			Book(author: "P.D. Mans", title: "Right Ho Jeeves")
 		]
 
-		// Create Fuse instance with data - index is created automatically
-		let fuse = await Fuse(data: books)
+		// Create Fuse instance - returns immediately, indexing happens in background
+		let fuse = Fuse(data: books)
 
+		// Search waits for index to be ready automatically
 		let results = try await fuse.search("odmanfict")
 
 		XCTAssertFalse(results.isEmpty)
@@ -47,8 +48,8 @@ final class FuseTests: XCTestCase {
 			Book(author: "George Orwell", title: "1984")
 		]
 
-		// Create once, search many times (fast!)
-		let fuse = await Fuse(data: books)
+		// Create once (non-blocking), search many times
+		let fuse = Fuse(data: books)
 
 		let queries = ["tolkien", "man", "orwell", "rings"]
 		for query in queries {
@@ -63,8 +64,8 @@ final class FuseTests: XCTestCase {
 	func testStringSearch() async throws {
 		let names = ["John Smith", "Jane Doe", "Bob Wilson", "Alice Johnson"]
 
-		// Create Fuse instance with string data
-		let fuse = await Fuse(data: names)
+		// Create Fuse instance with string data (non-blocking)
+		let fuse = Fuse(data: names)
 
 		let results = try await fuse.search("john")
 		XCTAssertEqual(results.count, 2) // "John Smith" and "Alice Johnson"
@@ -105,10 +106,24 @@ final class FuseTests: XCTestCase {
 	func testMaxResults() async throws {
 		let names = ["John Smith", "Johnny Appleseed", "John Doe", "Jonathan Swift"]
 
-		let fuse = await Fuse(data: names)
+		let fuse = Fuse(data: names)
 		let results = try await fuse.search("john", maxResults: 2)
 
 		XCTAssertEqual(results.count, 2)
+	}
+
+	// MARK: - Non-blocking Init
+
+	func testNonBlockingInit() async throws {
+		// Large dataset to demonstrate non-blocking behavior
+		let names = (0..<1000).map { "Name \($0)" }
+
+		// This should return immediately
+		let fuse = Fuse(data: names)
+
+		// First search waits for index, subsequent searches are instant
+		let results = try await fuse.search("Name 500")
+		XCTAssertFalse(results.isEmpty)
 	}
 }
 
