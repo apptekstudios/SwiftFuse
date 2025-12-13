@@ -119,7 +119,7 @@ public class Fuse {
 		}
 	}
 	
-	//// Searches for a pattern in a given string.
+	/// Searches for a pattern in a given string.
 	///
 	///     _search(pattern, in: "some string")
 	///
@@ -323,7 +323,8 @@ extension Fuse {
 			}
 		}
 		
-		return items.sorted { $0.result.score < $1.result.score }
+		let sorted = items.sorted { $0.result.score < $1.result.score }
+		return maxResults.map { Array(sorted.prefix($0)) } ?? sorted
 	}
 	
 	/// Searches for a text pattern in an array of `Fuseable` objects.

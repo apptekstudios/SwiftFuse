@@ -1,20 +1,20 @@
 import XCTest
-@testable import FuseForkSwift
+@testable import Fuse
 
 final class FuseForkSwiftTests: XCTestCase {
 
-	func testExample() throws {
-		
+	func testExample() async throws {
+
 
 		let books: [Book] = [
 			Book(author: "John X", title: "Old Man's War fiction"),
 			Book(author: "P.D. Mans", title: "Right Ho Jeeves")
 		]
-		
-		let fuse = Fuse()
+
+		let fuse = await Fuse()
 		var results: [Fuse.FusableSearchResult<Book>] = []
-		let time = ContinuousClock().measure {
-			results = fuse.search("odmanfict", in: books)
+		let time = await ContinuousClock().measure {
+			results = try! await fuse.search("odmanfict", in: books)
 		}
 		print(time.formatted(.time(pattern: .minuteSecond(padMinuteToLength: 0, fractionalSecondsLength: 5, roundFractionalSeconds: .up))))
 

@@ -31,7 +31,7 @@ extension String {
 	///
 	///  - Returns: The index within the calling String object of the first occurrence of `searchStr`, starting the search at `position`. Returns `nil` if the value is not found.
 	func index(of aString: String, startingFrom position: Int? = 0) -> String.Index? {
-		guard let position = position else {
+		guard let position = position, position < count else {
 			return nil
 		}
 		let range = index(fromOffset: position) ..< endIndex
