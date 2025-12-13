@@ -128,12 +128,20 @@ public class Fuse {
 	///   - aString: The string in which to search for the pattern
 	/// - Returns: A tuple containing a `score` between `0.0` (exact match) and `1` (not a match), and `ranges` of the matched characters. If no match is found will return a tuple with score of 1 and empty array of ranges.
 	private func _search(_ pattern: Pattern, in aString: String) -> ResultItem {
-		
-		var text = aString
-		
-		if !self.isCaseSensitive {
-			text = text.lowercased()
-		}
+		let text = self.isCaseSensitive ? aString : aString.lowercased()
+		return _search(pattern, in: aString, normalizedText: text)
+	}
+
+	/// Searches for a pattern in a given string using pre-normalized text.
+	///
+	/// This variant is used by `FuseIndex` to avoid re-lowercasing on each search.
+	///
+	/// - Parameters:
+	///   - pattern: The pattern to search for. This is created by calling `createPattern`
+	///   - originalString: The original string (used for result ranges)
+	///   - normalizedText: The pre-normalized (lowercased if case-insensitive) text to search
+	/// - Returns: A tuple containing a `score` between `0.0` (exact match) and `1` (not a match), and `ranges` of the matched characters.
+	private func _search(_ pattern: Pattern, in originalString: String, normalizedText text: String) -> ResultItem {
 		
 		let textLength = text.count
 		
@@ -278,8 +286,8 @@ public class Fuse {
 		}
 		
 		let ranges = Utilities.findRanges(matchMaskArr)
-	
-		return .init(score: score, ranges: ranges.map { aString.range(from: $0) })
+
+		return .init(score: score, ranges: ranges.map { originalString.range(from: $0) })
 	}
 }
 
@@ -399,5 +407,192 @@ extension Fuse {
 		let sorted = collectionResult.sorted { $0.score < $1.score }
 		return maxResults.map { Array(sorted.prefix($0)) } ?? sorted
 	}
-	
+
+}
+
+// MARK: - FuseIndex Support
+
+extension Fuse {
+
+	// MARK: Creating Indexes
+
+	/// Creates a preprocessed index from an array of strings for faster repeated searches.
+	///
+	/// Use this when you need to search the same dataset multiple times with different queries.
+	/// The index pre-computes lowercased text, avoiding redundant work on each search.
+	///
+	/// ## Example
+	///
+	///     let fuse = Fuse()
+	///     let names = ["John Smith", "Jane Doe", "Bob Wilson"]
+	///     let index = fuse.createIndex(from: names)
+	///
+	///     // Fast repeated searches - no re-lowercasing needed
+	///     let results1 = try await fuse.search("john", in: index)
+	///     let results2 = try await fuse.search("wilson", in: index)
+	///
+	/// - Parameter list: The array of strings to index
+	/// - Returns: A `FuseIndex` that can be used for repeated searches
+	public func createIndex(from list: [String]) -> FuseIndex<String> {
+		let indexedItems = list.enumerated().map { index, item in
+			FuseIndex<String>.IndexedItem(
+				item: item,
+				index: index,
+				properties: ["": (original: item, normalized: isCaseSensitive ? item : item.lowercased(), weight: 1.0)]
+			)
+		}
+		return FuseIndex(items: indexedItems, isCaseSensitive: isCaseSensitive)
+	}
+
+	/// Creates a preprocessed index from an array of `Fuseable` objects for faster repeated searches.
+	///
+	/// Use this when you need to search the same dataset multiple times with different queries.
+	/// The index pre-computes lowercased text and caches property metadata.
+	///
+	/// ## Example
+	///
+	///     let fuse = Fuse()
+	///     let books: [Book] = [
+	///         Book(author: "J.R.R. Tolkien", title: "The Lord of the Rings"),
+	///         Book(author: "George Orwell", title: "1984")
+	///     ]
+	///     let index = fuse.createIndex(from: books)
+	///
+	///     // Fast repeated searches
+	///     let results1 = try await fuse.search("tolkien", in: index)
+	///     let results2 = try await fuse.search("orwell", in: index)
+	///
+	/// - Parameter list: The array of `Fuseable` objects to index
+	/// - Returns: A `FuseIndex` that can be used for repeated searches
+	public func createIndex<T: Fuseable>(from list: [T]) -> FuseIndex<T> {
+		let indexedItems = list.enumerated().map { index, item in
+			var properties = [String: (original: String, normalized: String, weight: Double)]()
+			for (key, property) in item.fuseProperties {
+				properties[key] = (
+					original: property.value,
+					normalized: isCaseSensitive ? property.value : property.value.lowercased(),
+					weight: property.weight
+				)
+			}
+			return FuseIndex<T>.IndexedItem(
+				item: item,
+				index: index,
+				properties: properties
+			)
+		}
+		return FuseIndex(items: indexedItems, isCaseSensitive: isCaseSensitive)
+	}
+
+	// MARK: Searching with Indexes
+
+	/// Searches for a text pattern in a preprocessed string index.
+	///
+	/// This is faster than searching an array directly when performing multiple searches,
+	/// as the index has pre-computed lowercased text.
+	///
+	/// - Parameters:
+	///   - text: The pattern string to search for
+	///   - index: The preprocessed index to search
+	///   - maxResults: Optional limit on number of results returned
+	/// - Returns: An array of `StringSearchResult` sorted by score (best matches first)
+	public func search(_ text: String, in index: FuseIndex<String>, maxResults: Int? = nil) async throws -> [StringSearchResult] {
+		guard index.isCaseSensitive == self.isCaseSensitive else {
+			// Fall back to regular search if case sensitivity doesn't match
+			return try await search(text, in: index.items.map { $0.item }, maxResults: maxResults)
+		}
+
+		let pattern = self.createPattern(from: text)
+
+		var items = [StringSearchResult]()
+
+		for indexedItem in index.items {
+			try Task.checkCancellation()
+			if let result = searchIndexed(pattern, in: indexedItem.properties[""]!) {
+				items.append(.init(string: indexedItem.item, index: indexedItem.index, result: result))
+			}
+		}
+
+		let sorted = items.sorted { $0.result.score < $1.result.score }
+		return maxResults.map { Array(sorted.prefix($0)) } ?? sorted
+	}
+
+	/// Searches for a text pattern in a preprocessed `Fuseable` index.
+	///
+	/// This is faster than searching an array directly when performing multiple searches,
+	/// as the index has pre-computed lowercased text and cached property metadata.
+	///
+	/// - Parameters:
+	///   - text: The pattern string to search for
+	///   - index: The preprocessed index to search
+	///   - maxResults: Optional limit on number of results returned
+	/// - Returns: An array of `FusableSearchResult` sorted by score (best matches first)
+	public func search<T: Fuseable>(_ text: String, in index: FuseIndex<T>, maxResults: Int? = nil) async throws -> [FusableSearchResult<T>] {
+		guard index.isCaseSensitive == self.isCaseSensitive else {
+			// Fall back to regular search if case sensitivity doesn't match
+			return try await search(text, in: index.items.map { $0.item }, maxResults: maxResults)
+		}
+
+		try Task.checkCancellation()
+		let pattern = self.createPattern(from: text)
+
+		var collectionResult = [FusableSearchResult<T>]()
+
+		for indexedItem in index.items {
+			try Task.checkCancellation()
+			var scores = [Double]()
+			var totalScore = 0.0
+			var propertyResults = [String: ResultItem]()
+
+			for (key, property) in indexedItem.properties {
+				if let result = searchIndexed(pattern, in: property) {
+					let weight = property.weight == 1 ? 1 : 1 - property.weight
+					let score = (result.score == 0 && weight == 1 ? 0.001 : result.score) * weight
+					totalScore += score
+					scores.append(score)
+					propertyResults[key] = .init(score: score, ranges: result.ranges)
+				}
+			}
+
+			guard !scores.isEmpty else {
+				continue
+			}
+
+			collectionResult.append(FusableSearchResult(
+				item: indexedItem.item,
+				score: totalScore / Double(scores.count),
+				resultsByKey: propertyResults
+			))
+		}
+
+		let sorted = collectionResult.sorted { $0.score < $1.score }
+		return maxResults.map { Array(sorted.prefix($0)) } ?? sorted
+	}
+
+	// MARK: Private Helpers
+
+	/// Searches using pre-normalized indexed property data
+	private func searchIndexed(_ pattern: Pattern?, in property: (original: String, normalized: String, weight: Double)) -> ResultItem? {
+		guard let pattern = pattern else {
+			return nil
+		}
+
+		if tokenize {
+			let wordPatterns = pattern.text.split(separator: " ").compactMap { createPattern(from: String($0)) }
+			let fullPatternResult = _search(pattern, in: property.original, normalizedText: property.normalized)
+
+			let results = wordPatterns.reduce(into: fullPatternResult) { totalResult, wordPattern in
+				let result = _search(wordPattern, in: property.original, normalizedText: property.normalized)
+				totalResult = .init(score: totalResult.score + result.score, ranges: totalResult.ranges + result.ranges)
+			}
+
+			let averagedResult = ResultItem(
+				score: results.score / Double(wordPatterns.count + 1),
+				ranges: Array(Set(results.ranges))
+			)
+			return averagedResult.score == 1 ? nil : averagedResult
+		} else {
+			let result = _search(pattern, in: property.original, normalizedText: property.normalized)
+			return result.score == 1 ? nil : result
+		}
+	}
 }
