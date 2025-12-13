@@ -13,8 +13,24 @@ public struct FuseIndex<T: Sendable>: Sendable {
 		public let item: T
 		/// The original index in the source collection
 		public let index: Int
-		/// Preprocessed properties: key -> (originalValue, lowercasedValue, weight)
-		public let properties: [String: (original: String, normalized: String, weight: Double)]
+		/// Preprocessed properties: key -> IndexedProperty
+		public let properties: [String: IndexedProperty]
+	}
+
+	/// Preprocessed property data optimized for search
+	public struct IndexedProperty: Sendable {
+		/// Original string value
+		public let original: String
+		/// Normalized (lowercased) string for matching
+		public let normalized: String
+		/// Characters as array for O(1) random access during search
+		public let characters: [Character]
+		/// Set of unique characters for quick pre-filtering
+		public let characterSet: Set<Character>
+		/// Property weight for scoring
+		public let weight: Double
+		/// Text length (cached)
+		public let length: Int
 	}
 
 	/// All indexed items

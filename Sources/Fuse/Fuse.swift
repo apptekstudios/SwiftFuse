@@ -139,10 +139,19 @@ public class Fuse<T: Sendable>: Sendable {
 
 	private func buildStringIndex(from data: [String]) {
 		let indexedItems = data.enumerated().map { idx, item in
-			FuseIndex<String>.IndexedItem(
+			let normalized = isCaseSensitive ? item : item.lowercased()
+			let characters = Array(normalized)
+			return FuseIndex<String>.IndexedItem(
 				item: item,
 				index: idx,
-				properties: ["": (original: item, normalized: isCaseSensitive ? item : item.lowercased(), weight: 1.0)]
+				properties: ["": FuseIndex<String>.IndexedProperty(
+					original: item,
+					normalized: normalized,
+					characters: characters,
+					characterSet: Set(characters),
+					weight: 1.0,
+					length: characters.count
+				)]
 			)
 		}
 		self.index = FuseIndex(items: indexedItems, isCaseSensitive: isCaseSensitive) as? FuseIndex<T>
@@ -151,12 +160,17 @@ public class Fuse<T: Sendable>: Sendable {
 
 	private func buildFuseableIndex<U: Fuseable>(from data: [U]) where T == U {
 		let indexedItems = data.enumerated().map { idx, item in
-			var properties = [String: (original: String, normalized: String, weight: Double)]()
+			var properties = [String: FuseIndex<T>.IndexedProperty]()
 			for (key, property) in item.fuseProperties {
-				properties[key] = (
+				let normalized = isCaseSensitive ? property.value : property.value.lowercased()
+				let characters = Array(normalized)
+				properties[key] = FuseIndex<T>.IndexedProperty(
 					original: property.value,
-					normalized: isCaseSensitive ? property.value : property.value.lowercased(),
-					weight: property.weight
+					normalized: normalized,
+					characters: characters,
+					characterSet: Set(characters),
+					weight: property.weight,
+					length: characters.count
 				)
 			}
 			return FuseIndex<T>.IndexedItem(
@@ -306,17 +320,26 @@ public class Fuse<T: Sendable>: Sendable {
 	// MARK: - Private Search Implementation
 
 	/// Searches using pre-normalized indexed property data
-	private func searchIndexed(_ pattern: Pattern?, in property: (original: String, normalized: String, weight: Double)) -> ResultItem? {
+	private func searchIndexed<U>(_ pattern: Pattern?, in property: FuseIndex<U>.IndexedProperty) -> ResultItem? {
 		guard let pattern = pattern else {
+			return nil
+		}
+
+		// Pre-filter: check if text contains enough pattern characters to possibly match
+		// If fewer than half the pattern characters exist in the text, skip expensive search
+		let patternChars = Set(pattern.text)
+		let matchingChars = patternChars.intersection(property.characterSet)
+		let minRequiredChars = max(1, patternChars.count / 2)
+		if matchingChars.count < minRequiredChars {
 			return nil
 		}
 
 		if tokenize {
 			let wordPatterns = pattern.text.split(separator: " ").compactMap { createPattern(from: String($0)) }
-			let fullPatternResult = _search(pattern, in: property.original, normalizedText: property.normalized)
+			let fullPatternResult = _search(pattern, in: property.original, characters: property.characters, textLength: property.length)
 
 			let results = wordPatterns.reduce(into: fullPatternResult) { totalResult, wordPattern in
-				let result = _search(wordPattern, in: property.original, normalizedText: property.normalized)
+				let result = _search(wordPattern, in: property.original, characters: property.characters, textLength: property.length)
 				totalResult = ResultItem(score: totalResult.score + result.score, ranges: totalResult.ranges + result.ranges)
 			}
 
@@ -326,19 +349,20 @@ public class Fuse<T: Sendable>: Sendable {
 			)
 			return averagedResult.score == 1 ? nil : averagedResult
 		} else {
-			let result = _search(pattern, in: property.original, normalizedText: property.normalized)
+			let result = _search(pattern, in: property.original, characters: property.characters, textLength: property.length)
 			return result.score == 1 ? nil : result
 		}
 	}
 
-	/// Core Bitap algorithm implementation
-	private func _search(_ pattern: Pattern, in originalString: String, normalizedText text: String) -> ResultItem {
+	/// Core Bitap algorithm implementation with O(1) character access
+	private func _search(_ pattern: Pattern, in originalString: String, characters: [Character], textLength: Int) -> ResultItem {
 
-		let textLength = text.count
+		// Create normalized string for substring search (used only for exact match finding)
+		let normalizedText = String(characters)
 
 		// Exact match
-		if pattern.text == text {
-			return ResultItem(score: 0, ranges: [text.startIndex ..< text.endIndex])
+		if pattern.text == normalizedText {
+			return ResultItem(score: 0, ranges: [originalString.startIndex ..< originalString.endIndex])
 		}
 
 		let location = self.location
@@ -346,8 +370,8 @@ public class Fuse<T: Sendable>: Sendable {
 		var threshold = self.threshold
 
 		var bestLocation: Int? = {
-			if let index = text.index(of: pattern.text, startingFrom: location) {
-				return text.distance(from: text.startIndex, to: index)
+			if let index = normalizedText.index(of: pattern.text, startingFrom: location) {
+				return normalizedText.distance(from: normalizedText.startIndex, to: index)
 			}
 			return nil
 		}()
@@ -356,13 +380,13 @@ public class Fuse<T: Sendable>: Sendable {
 		var matchMaskArr = [Int](repeating: 0, count: textLength)
 
 		// Get all exact matches for speed up
-		var index = text.index(of: pattern.text, startingFrom: bestLocation)
+		var index = normalizedText.index(of: pattern.text, startingFrom: bestLocation)
 		while index != nil {
-			let i = text.distance(from: text.startIndex, to: index!)
+			let i = normalizedText.distance(from: normalizedText.startIndex, to: index!)
 			let score = Utilities.calculateScore(pattern.len, e: 0, x: i, loc: location, distance: distance, ignoreLocation: ignoreLocation)
 			threshold = min(threshold, score)
 			bestLocation = i + pattern.len
-			index = text.index(of: pattern.text, startingFrom: bestLocation)
+			index = normalizedText.index(of: pattern.text, startingFrom: bestLocation)
 
 			var idx = 0
 			while idx < pattern.len {
@@ -377,8 +401,6 @@ public class Fuse<T: Sendable>: Sendable {
 		var score = 1.0
 		var binMax: Int = pattern.len + textLength
 		var lastBitArr = [Int]()
-
-		let textCount = text.count
 
 		// Bitap algorithm
 		for i in 0..<pattern.len {
@@ -405,15 +427,13 @@ public class Fuse<T: Sendable>: Sendable {
 				continue
 			}
 
-			var currentLocationIndex: String.Index? = nil
-
+			// O(1) character access using array instead of String.Index traversal
 			for j in (start...finish).reversed() {
 				let currentLocation = j - 1
 
 				let charMatch: Int = {
-					if currentLocation < textCount {
-						currentLocationIndex = currentLocationIndex.map { text.index(before: $0) } ?? text.index(text.startIndex, offsetBy: currentLocation)
-						let char = text[currentLocationIndex!]
+					if currentLocation < textLength {
+						let char = characters[currentLocation]
 						if let result = pattern.alphabet[char] {
 							return result
 						}
