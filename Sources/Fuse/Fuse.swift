@@ -2,9 +2,17 @@
 
 import Foundation
 
-@globalActor
-public actor FuseActor {
-	public static let shared = FuseActor()
+/// Internal actor that manages the index state
+private actor IndexManager<T: Sendable> {
+	private let indexTask: Task<FuseIndex<T>, Never>
+
+	init(task: Task<FuseIndex<T>, Never>) {
+		self.indexTask = task
+	}
+
+	func getIndex() async -> FuseIndex<T> {
+		await indexTask.value
+	}
 }
 
 /// A fuzzy search engine using the Bitap algorithm.
@@ -24,8 +32,7 @@ public actor FuseActor {
 ///
 ///     let results = try await Fuse.search("tolkien", in: books)
 ///
-@FuseActor
-public class Fuse<T: Sendable>: Sendable {
+public final class Fuse<T: Sendable>: Sendable {
 	private let location: Int
 	private let distance: Int
 	private let threshold: Double
@@ -34,14 +41,11 @@ public class Fuse<T: Sendable>: Sendable {
 	private let tokenize: Bool
 	private let ignoreLocation: Bool
 
-	/// The preprocessed index for fast searches (nil until indexing completes)
-	private var index: FuseIndex<T>?
+	/// The original source data used to create this Fuse instance
+	public let sourceData: [T]
 
-	/// Continuations waiting for the index to be ready
-	private var waiters: [CheckedContinuation<Void, Never>] = []
-
-	/// Whether indexing has completed
-	private var isIndexReady: Bool = false
+	/// Actor-managed index state
+	private let indexManager: IndexManager<T>
 
 	public typealias Pattern = (text: String, len: Int, mask: Int, alphabet: [Character: Int])
 
@@ -90,11 +94,14 @@ public class Fuse<T: Sendable>: Sendable {
 		self.isCaseSensitive = isCaseSensitive
 		self.tokenize = tokenize
 		self.ignoreLocation = ignoreLocation
+		self.sourceData = data
 
 		// Build index asynchronously in background
-		Task { [weak self] in
-			await self?.buildStringIndex(from: data)
+		let caseSensitive = isCaseSensitive
+		let task = Task {
+			Self.buildStringIndex(from: data, isCaseSensitive: caseSensitive)
 		}
+		self.indexManager = IndexManager(task: task)
 	}
 
 	/// Creates a new `Fuse` instance with a dataset of `Fuseable` objects.
@@ -128,16 +135,19 @@ public class Fuse<T: Sendable>: Sendable {
 		self.isCaseSensitive = isCaseSensitive
 		self.tokenize = tokenize
 		self.ignoreLocation = ignoreLocation
+		self.sourceData = data
 
 		// Build index asynchronously in background
-		Task { [weak self] in
-			await self?.buildFuseableIndex(from: data)
+		let caseSensitive = isCaseSensitive
+		let task = Task {
+			Self.buildFuseableIndex(from: data, isCaseSensitive: caseSensitive)
 		}
+		self.indexManager = IndexManager(task: task)
 	}
 
-	// MARK: - Background Index Building
+	// MARK: - Static Index Building
 
-	private func buildStringIndex(from data: [String]) {
+	private static func buildStringIndex(from data: [String], isCaseSensitive: Bool) -> FuseIndex<String> {
 		let indexedItems = data.enumerated().map { idx, item in
 			let normalized = isCaseSensitive ? item : item.lowercased()
 			let characters = Array(normalized)
@@ -154,17 +164,16 @@ public class Fuse<T: Sendable>: Sendable {
 				)]
 			)
 		}
-		self.index = FuseIndex(items: indexedItems, isCaseSensitive: isCaseSensitive) as? FuseIndex<T>
-		markIndexReady()
+		return FuseIndex(items: indexedItems, isCaseSensitive: isCaseSensitive)
 	}
 
-	private func buildFuseableIndex<U: Fuseable>(from data: [U]) where T == U {
+	private static func buildFuseableIndex<U: Fuseable>(from data: [U], isCaseSensitive: Bool) -> FuseIndex<U> {
 		let indexedItems = data.enumerated().map { idx, item in
-			var properties = [String: FuseIndex<T>.IndexedProperty]()
+			var properties = [String: FuseIndex<U>.IndexedProperty]()
 			for (key, property) in item.fuseProperties {
 				let normalized = isCaseSensitive ? property.value : property.value.lowercased()
 				let characters = Array(normalized)
-				properties[key] = FuseIndex<T>.IndexedProperty(
+				properties[key] = FuseIndex<U>.IndexedProperty(
 					original: property.value,
 					normalized: normalized,
 					characters: characters,
@@ -173,36 +182,13 @@ public class Fuse<T: Sendable>: Sendable {
 					length: characters.count
 				)
 			}
-			return FuseIndex<T>.IndexedItem(
+			return FuseIndex<U>.IndexedItem(
 				item: item,
 				index: idx,
 				properties: properties
 			)
 		}
-		self.index = FuseIndex(items: indexedItems, isCaseSensitive: isCaseSensitive)
-		markIndexReady()
-	}
-
-	private func markIndexReady() {
-		isIndexReady = true
-		// Resume all waiting continuations
-		for waiter in waiters {
-			waiter.resume()
-		}
-		waiters.removeAll()
-	}
-
-	/// Waits for the index to be ready
-	private func awaitIndexReady() async {
-		if isIndexReady { return }
-
-		await withCheckedContinuation { continuation in
-			if isIndexReady {
-				continuation.resume()
-			} else {
-				waiters.append(continuation)
-			}
-		}
+		return FuseIndex(items: indexedItems, isCaseSensitive: isCaseSensitive)
 	}
 
 	// MARK: - Instance Search Methods
@@ -219,9 +205,7 @@ public class Fuse<T: Sendable>: Sendable {
 	///   - maxResults: Optional limit on number of results returned
 	/// - Returns: An array of `SearchResult` sorted by score (best matches first)
 	public func search(_ text: String, maxResults: Int? = nil) async throws -> [SearchResult] where T == String {
-		await awaitIndexReady()
-
-		guard let index = index else { return [] }
+		let index = await indexManager.getIndex()
 
 		let pattern = createPattern(from: text)
 		var items = [SearchResult]()
@@ -254,9 +238,7 @@ public class Fuse<T: Sendable>: Sendable {
 	///   - maxResults: Optional limit on number of results returned
 	/// - Returns: An array of `SearchResult` sorted by score (best matches first)
 	public func search(_ text: String, maxResults: Int? = nil) async throws -> [SearchResult] where T: Fuseable {
-		await awaitIndexReady()
-
-		guard let index = index else { return [] }
+		let index = await indexManager.getIndex()
 
 		try Task.checkCancellation()
 		let pattern = createPattern(from: text)
