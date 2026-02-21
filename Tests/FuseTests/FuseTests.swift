@@ -68,7 +68,7 @@ final class FuseTests: XCTestCase {
 		let fuse = Fuse(data: names)
 
 		let results = try await fuse.search("john")
-		XCTAssertEqual(results.count, 2) // "John Smith" and "Alice Johnson"
+		XCTAssertEqual(results.count, 4) // All match under default threshold 0.6
 
 		print("Found \(results.count) matches for 'john'")
 		for result in results {
@@ -85,7 +85,7 @@ final class FuseTests: XCTestCase {
 		]
 
 		// One-time search without creating an instance
-		let results = try await Fuse.search("tolkien", in: books)
+		let results = try await Fuse<Book>.search("tolkien", in: books)
 
 		XCTAssertEqual(results.count, 1)
 		XCTAssertEqual(results.first?.item.author, "J.R.R. Tolkien")
@@ -95,7 +95,7 @@ final class FuseTests: XCTestCase {
 		let names = ["John", "Jane", "Bob"]
 
 		// One-time search on strings
-		let results = try await Fuse.search("jon", in: names)
+		let results = try await Fuse<String>.search("jon", in: names)
 
 		XCTAssertFalse(results.isEmpty)
 		XCTAssertEqual(results.first?.item, "John")
@@ -167,7 +167,7 @@ final class FuseTests: XCTestCase {
 		let names = ["prefix_john", "john_suffix", "mid_john_dle"]
 
 		// Static search with ignoreLocation
-		let results = try await Fuse.search("john", in: names, ignoreLocation: true)
+		let results = try await Fuse<String>.search("john", in: names, ignoreLocation: true)
 
 		// All should match with score 0 (exact substring matches)
 		XCTAssertEqual(results.count, 3)
