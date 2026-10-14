@@ -1,554 +1,395 @@
-
-
 import Foundation
 
-/// Internal actor that manages the index state
-private actor IndexManager<T: Sendable> {
-	private let indexTask: Task<FuseIndex<T>, Never>
+/// Fuzzy search over a collection, with the semantics and scoring of
+/// [Fuse.js](https://www.fusejs.io).
+///
+/// ```swift
+/// let fuse = Fuse(["Old Man's War", "The Lock Artist", "HTML5"])
+/// let hits = fuse.search("old")            // [FuseResult<String>]
+/// hits.first?.item                           // "Old Man's War"
+/// ```
+///
+/// Creating a `Fuse` is O(1): the index is built on the first search (or in the background /
+/// immediately, see ``IndexingStrategy``) and then reused. Searches are available synchronously
+/// (single-threaded, no suspension) and asynchronously (large collections are split across cores,
+/// and the call respects task cancellation).
+///
+/// `Fuse` is a thread-safe reference type: items can be added and removed after creation and the
+/// index is updated incrementally.
+public final class Fuse<Item: Sendable>: @unchecked Sendable {
+    /// When the index is built.
+    public enum IndexingStrategy: Sendable {
+        /// Build on the first search. `init` does no work. **Default.**
+        case lazy
+        /// Start building on a detached background task as soon as the instance is created. The
+        /// first search waits for that task instead of building itself.
+        case background
+        /// Build synchronously inside `init`.
+        case immediate
+    }
 
-	init(task: Task<FuseIndex<T>, Never>) {
-		self.indexTask = task
-	}
+    /// The options this instance was created with.
+    public let options: FuseOptions
+    /// The keys this instance searches. Empty for `[String]` collections.
+    public let keys: [FuseKey<Item>]
 
-	func getIndex() async -> FuseIndex<T> {
-		await indexTask.value
-	}
+    private let builder: IndexBuilder<Item>
+    private let normalizedWeights: [Double]
+    private let state: Locked<State>
+
+    private struct State {
+        var items: [Item]
+        var index: IndexState
+        /// Bumped on every mutation so a stale build is never stored.
+        var version: UInt64 = 0
+    }
+
+    private enum IndexState {
+        case pending
+        case building(Task<FuseIndex, Never>, version: UInt64)
+        case ready(FuseIndex)
+    }
+
+    // MARK: - Creating
+
+    /// Creates a search over `items`, extracting text with `keys`.
+    public convenience init(_ items: [Item], keys: [FuseKey<Item>], options: FuseOptions = .default, indexing: IndexingStrategy = .lazy) {
+        self.init(items, keys: keys, options: options, indexing: indexing, stringValue: nil)
+    }
+
+    init(_ items: [Item], keys: [FuseKey<Item>], options: FuseOptions, indexing: IndexingStrategy, stringValue: (@Sendable (Item) -> String)?) {
+        self.options = options
+        self.keys = keys
+        self.builder = IndexBuilder(keys: keys, options: options, stringValue: stringValue)
+        let totalWeight = keys.reduce(0) { $0 + $1.weight }
+        self.normalizedWeights = keys.map { $0.weight / totalWeight }
+        self.state = Locked(State(items: items, index: .pending))
+        startIndexing(indexing)
+    }
+
+    /// Creates a search over `items` using a prebuilt index (see ``createIndex(_:keys:options:)``).
+    ///
+    /// - Precondition: `index` was built for exactly these items with the same key names and
+    ///   compatible options.
+    public init(_ items: [Item], keys: [FuseKey<Item>], index: FuseIndex, options: FuseOptions = .default) {
+        precondition(index.itemCount == items.count, "FuseIndex covers \(index.itemCount) items but \(items.count) were supplied")
+        precondition(index.keyNames == keys.map(\.name), "FuseIndex key names \(index.keyNames) do not match supplied keys \(keys.map(\.name))")
+        precondition(index.isCompatible(with: options), "FuseIndex was built with different normalisation options")
+        self.options = options
+        self.keys = keys
+        self.builder = IndexBuilder(keys: keys, options: options)
+        let totalWeight = keys.reduce(0) { $0 + $1.weight }
+        self.normalizedWeights = keys.map { $0.weight / totalWeight }
+        self.state = Locked(State(items: items, index: .ready(index)))
+    }
+
+    private func startIndexing(_ strategy: IndexingStrategy) {
+        switch strategy {
+        case .lazy:
+            break
+        case .immediate:
+            let items = state.withLock { $0.items }
+            let index = builder.build(items)
+            state.withLock { $0.index = .ready(index) }
+        case .background:
+            let items = state.withLock { $0.items }
+            let builder = self.builder
+            let task = Task.detached(priority: .utility) { await builder.build(items) }
+            state.withLock { $0.index = .building(task, version: 0) }
+        }
+    }
+
+    // MARK: - Collection
+
+    /// The current items, in index order.
+    public var items: [Item] {
+        state.withLock { $0.items }
+    }
+
+    /// Number of items.
+    public var count: Int {
+        state.withLock { $0.items.count }
+    }
+
+    /// Replaces the whole collection. The index is rebuilt lazily.
+    public func setItems(_ items: [Item]) {
+        state.withLock {
+            $0.items = items
+            $0.index = .pending
+            $0.version &+= 1
+        }
+    }
+
+    /// Appends an item. If the index is already built it is extended in place.
+    public func add(_ item: Item) {
+        add(contentsOf: [item])
+    }
+
+    /// Appends items. If the index is already built it is extended in place.
+    public func add(contentsOf newItems: [Item]) {
+        guard !newItems.isEmpty else { return }
+        let builder = self.builder
+        state.withLock { state in
+            state.items.append(contentsOf: newItems)
+            state.version &+= 1
+            if case .ready(var index) = state.index {
+                index.append(newItems, builder: builder)
+                state.index = .ready(index)
+            } else {
+                state.index = .pending
+            }
+        }
+    }
+
+    /// Removes and returns every item for which `shouldRemove` returns `true`.
+    @discardableResult
+    public func remove(where shouldRemove: (_ item: Item, _ index: Int) -> Bool) -> [Item] {
+        state.withLock { state in
+            var removed: [Item] = []
+            var removedIndices: [Int] = []
+            for (index, item) in state.items.enumerated() where shouldRemove(item, index) {
+                removed.append(item)
+                removedIndices.append(index)
+            }
+            guard !removedIndices.isEmpty else { return [] }
+            let removedSet = Set(removedIndices)
+            state.items = state.items.enumerated().compactMap { removedSet.contains($0.offset) ? nil : $0.element }
+            state.version &+= 1
+            if case .ready(var index) = state.index {
+                index.remove(itemIndices: removedIndices)
+                state.index = .ready(index)
+            } else {
+                state.index = .pending
+            }
+            return removed
+        }
+    }
+
+    /// Removes and returns the item at `position`.
+    @discardableResult
+    public func remove(at position: Int) -> Item {
+        state.withLock { state in
+            precondition(state.items.indices.contains(position), "Index \(position) out of range")
+            let item = state.items.remove(at: position)
+            state.version &+= 1
+            if case .ready(var index) = state.index {
+                index.remove(itemIndices: [position])
+                state.index = .ready(index)
+            } else {
+                state.index = .pending
+            }
+            return item
+        }
+    }
+
+    // MARK: - Index
+
+    /// The index for the current items, building it now if needed.
+    public var index: FuseIndex {
+        resolveIndex().index
+    }
+
+    /// Builds the index now (on the calling thread) if it is not ready yet.
+    public func prepare() {
+        _ = resolveIndex()
+    }
+
+    /// Builds the index if it is not ready yet, sharing the work with any build already in flight.
+    public func prepare() async {
+        _ = await resolveIndexAsync()
+    }
+
+    /// Whether the index is built for the current items.
+    public var isIndexed: Bool {
+        state.withLock {
+            if case .ready = $0.index { return true }
+            return false
+        }
+    }
+
+    /// Builds an index for `items` that can be stored and later passed to
+    /// ``init(_:keys:index:options:)``.
+    public static func createIndex(_ items: [Item], keys: [FuseKey<Item>], options: FuseOptions = .default) -> FuseIndex {
+        IndexBuilder(keys: keys, options: options).build(items)
+    }
+
+    private func resolveIndex() -> (items: [Item], index: FuseIndex) {
+        let (items, indexState, version) = state.withLock { ($0.items, $0.index, $0.version) }
+        if case .ready(let index) = indexState {
+            return (items, index)
+        }
+        // Either pending, or an async build is in flight that we cannot wait for synchronously.
+        // Building here is always correct; it only duplicates work in the latter (rare) case.
+        let index = builder.build(items)
+        store(index, version: version)
+        return (items, index)
+    }
+
+    private func resolveIndexAsync() async -> (items: [Item], index: FuseIndex) {
+        let builder = self.builder
+        let (items, task, version): ([Item], Task<FuseIndex, Never>?, UInt64) = state.withLock { state in
+            switch state.index {
+            case .ready(let index):
+                return (state.items, Task { index }, state.version)
+            case .building(let task, _):
+                return (state.items, task, state.version)
+            case .pending:
+                let items = state.items
+                let task = Task.detached { await builder.build(items) }
+                state.index = .building(task, version: state.version)
+                return (items, task, state.version)
+            }
+        }
+        let index = await task!.value
+        store(index, version: version)
+        return (items, index)
+    }
+
+    private func store(_ index: FuseIndex, version: UInt64) {
+        state.withLock { state in
+            guard state.version == version else { return }
+            if case .ready = state.index { return }
+            state.index = .ready(index)
+        }
+    }
+
+    // MARK: - Searching
+
+    /// Searches synchronously on the calling thread.
+    ///
+    /// - Parameters:
+    ///   - pattern: The text to look for. A blank pattern returns every item, unranked.
+    ///   - limit: Maximum number of results.
+    public func search(_ pattern: String, limit: Int? = nil) -> [FuseResult<Item>] {
+        let (items, index) = resolveIndex()
+        guard let job = SearchJob(pattern: pattern, index: index, options: options, weights: normalizedWeights) else {
+            return unranked(items, limit: limit)
+        }
+        var results: [RawResult] = []
+        try? job.run(items: 0 ..< index.itemCount, cancellable: false, into: &results)
+        return finish(results, job: job, items: items, limit: limit)
+    }
+
+    /// Searches with a logical query synchronously on the calling thread.
+    public func search(_ query: FuseQuery, limit: Int? = nil) -> [FuseResult<Item>] {
+        let (items, index) = resolveIndex()
+        let job = SearchJob(query: query, index: index, options: options, weights: normalizedWeights)
+        var results: [RawResult] = []
+        try? job.run(items: 0 ..< index.itemCount, cancellable: false, into: &results)
+        return finish(results, job: job, items: items, limit: limit)
+    }
+
+    /// Searches asynchronously. Large collections are evaluated in parallel across cores, and the
+    /// search stops early with `CancellationError` if the calling task is cancelled.
+    public func search(_ pattern: String, limit: Int? = nil) async throws -> [FuseResult<Item>] {
+        let (items, index) = await resolveIndexAsync()
+        try Task.checkCancellation()
+        guard let job = SearchJob(pattern: pattern, index: index, options: options, weights: normalizedWeights) else {
+            return unranked(items, limit: limit)
+        }
+        return finish(try await run(job), job: job, items: items, limit: limit)
+    }
+
+    /// Searches with a logical query asynchronously.
+    public func search(_ query: FuseQuery, limit: Int? = nil) async throws -> [FuseResult<Item>] {
+        let (items, index) = await resolveIndexAsync()
+        try Task.checkCancellation()
+        let job = SearchJob(query: query, index: index, options: options, weights: normalizedWeights)
+        return finish(try await run(job), job: job, items: items, limit: limit)
+    }
+
+    /// Items per task when searching in parallel.
+    static var parallelChunkSize: Int { 2048 }
+
+    private func run(_ job: SearchJob) async throws -> [RawResult] {
+        let count = job.index.itemCount
+        let workers = min(ProcessInfo.processInfo.activeProcessorCount, count / Self.parallelChunkSize)
+        if workers <= 1 {
+            var results: [RawResult] = []
+            try job.run(items: 0 ..< count, cancellable: true, into: &results)
+            return results
+        }
+        let chunk = (count + workers - 1) / workers
+        return try await withThrowingTaskGroup(of: [RawResult].self) { group in
+            for start in stride(from: 0, to: count, by: chunk) {
+                let range = start ..< min(start + chunk, count)
+                group.addTask {
+                    var results: [RawResult] = []
+                    try job.run(items: range, cancellable: true, into: &results)
+                    return results
+                }
+            }
+            var all: [RawResult] = []
+            for try await part in group {
+                all.append(contentsOf: part)
+            }
+            return all
+        }
+    }
+
+    private func finish(_ raw: [RawResult], job: SearchJob, items: [Item], limit: Int?) -> [FuseResult<Item>] {
+        var results = raw
+        ResultOrdering.finalize(&results, shouldSort: options.shouldSort, limit: limit)
+        return results.map { job.format($0, items: items, includeMatches: options.includeMatches) }
+    }
+
+    private func unranked(_ items: [Item], limit: Int?) -> [FuseResult<Item>] {
+        var results = items.enumerated().map { FuseResult(item: $0.element, refIndex: $0.offset, score: 0) }
+        if let limit, limit >= 0, results.count > limit { results.removeSubrange(limit...) }
+        return results
+    }
 }
 
-/// A fuzzy search engine using the Bitap algorithm.
-///
-/// ## Creating an Instance with Data (Recommended for repeated searches)
-///
-/// When you need to search the same dataset multiple times, create a `Fuse` instance with your data.
-/// The index is built asynchronously in the background - init returns immediately:
-///
-///     let fuse = Fuse(data: books)  // Returns immediately, indexing in background
-///     let results1 = try await fuse.search("tolkien")  // Waits for index if needed
-///     let results2 = try await fuse.search("orwell")   // Index ready, instant
-///
-/// ## One-Time Searches (Static Method)
-///
-/// For single searches where you don't need to reuse the index:
-///
-///     let results = try await Fuse.search("tolkien", in: books)
-///
-public final class Fuse<T: Sendable>: Sendable {
-	private let location: Int
-	private let distance: Int
-	private let threshold: Double
-	private let maxPatternLength: Int
-	private let isCaseSensitive: Bool
-	private let tokenize: Bool
-	private let ignoreLocation: Bool
-
-	/// The original source data used to create this Fuse instance
-	public let sourceData: [T]
-
-	/// Actor-managed index state
-	private let indexManager: IndexManager<T>
-
-	public typealias Pattern = (text: String, len: Int, mask: Int, alphabet: [Character: Int])
-
-	public struct SearchResult: Sendable {
-		public var item: T
-		public var index: Int
-		public var score: Double
-		public var results: [String: ResultItem]
-	}
-
-	public struct ResultItem: Sendable {
-		public var score: Double
-		public var ranges: [Range<String.Index>]
-	}
-
-	// MARK: - Initialization
-
-	/// Creates a new `Fuse` instance with a dataset of strings.
-	///
-	/// The index is built asynchronously in the background. Init returns immediately.
-	/// Search calls will automatically wait for the index to be ready.
-	///
-	/// - Parameters:
-	///   - data: The array of strings to search
-	///   - location: Approximately where in the text is the pattern expected to be found. Defaults to `0`
-	///   - distance: Determines how close the match must be to the fuzzy `location`. Defaults to `100`
-	///   - threshold: At what point does the match algorithm give up. A threshold of `0.0` requires a perfect match, `1.0` matches anything. Defaults to `0.6`
-	///   - maxPatternLength: The maximum valid pattern length. Defaults to `32`
-	///   - isCaseSensitive: Indicates whether comparisons should be case sensitive. Defaults to `false`
-	///   - tokenize: When true, searches individual words and the full string. Defaults to `false`
-	///   - ignoreLocation: When true, search will ignore where in the string the pattern is expected to be found. Defaults to `false`
-	public init(
-		data: [String],
-		location: Int = 0,
-		distance: Int = 100,
-		threshold: Double = 0.6,
-		maxPatternLength: Int = 32,
-		isCaseSensitive: Bool = false,
-		tokenize: Bool = false,
-		ignoreLocation: Bool = false
-	) where T == String {
-		self.location = location
-		self.distance = distance
-		self.threshold = threshold
-		self.maxPatternLength = maxPatternLength
-		self.isCaseSensitive = isCaseSensitive
-		self.tokenize = tokenize
-		self.ignoreLocation = ignoreLocation
-		self.sourceData = data
-
-		// Build index asynchronously in background
-		let caseSensitive = isCaseSensitive
-		let task = Task {
-			Self.buildStringIndex(from: data, isCaseSensitive: caseSensitive)
-		}
-		self.indexManager = IndexManager(task: task)
-	}
-
-	/// Creates a new `Fuse` instance with a dataset of `Fuseable` objects.
-	///
-	/// The index is built asynchronously in the background. Init returns immediately.
-	/// Search calls will automatically wait for the index to be ready.
-	///
-	/// - Parameters:
-	///   - data: The array of `Fuseable` objects to search
-	///   - location: Approximately where in the text is the pattern expected to be found. Defaults to `0`
-	///   - distance: Determines how close the match must be to the fuzzy `location`. Defaults to `100`
-	///   - threshold: At what point does the match algorithm give up. A threshold of `0.0` requires a perfect match, `1.0` matches anything. Defaults to `0.6`
-	///   - maxPatternLength: The maximum valid pattern length. Defaults to `32`
-	///   - isCaseSensitive: Indicates whether comparisons should be case sensitive. Defaults to `false`
-	///   - tokenize: When true, searches individual words and the full string. Defaults to `false`
-	///   - ignoreLocation: When true, search will ignore where in the string the pattern is expected to be found. Defaults to `false`
-	public init(
-		data: [T],
-		location: Int = 0,
-		distance: Int = 100,
-		threshold: Double = 0.6,
-		maxPatternLength: Int = 32,
-		isCaseSensitive: Bool = false,
-		tokenize: Bool = false,
-		ignoreLocation: Bool = false
-	) where T: Fuseable {
-		self.location = location
-		self.distance = distance
-		self.threshold = threshold
-		self.maxPatternLength = maxPatternLength
-		self.isCaseSensitive = isCaseSensitive
-		self.tokenize = tokenize
-		self.ignoreLocation = ignoreLocation
-		self.sourceData = data
-
-		// Build index asynchronously in background
-		let caseSensitive = isCaseSensitive
-		let task = Task {
-			Self.buildFuseableIndex(from: data, isCaseSensitive: caseSensitive)
-		}
-		self.indexManager = IndexManager(task: task)
-	}
-
-	// MARK: - Static Index Building
-
-	private static func buildStringIndex(from data: [String], isCaseSensitive: Bool) -> FuseIndex<String> {
-		let indexedItems = data.enumerated().map { idx, item in
-			let normalized = isCaseSensitive ? item : item.lowercased()
-			let characters = Array(normalized)
-			return FuseIndex<String>.IndexedItem(
-				item: item,
-				index: idx,
-				properties: ["": FuseIndex<String>.IndexedProperty(
-					original: item,
-					normalized: normalized,
-					characters: characters,
-					characterSet: Set(characters),
-					weight: 1.0,
-					length: characters.count
-				)]
-			)
-		}
-		return FuseIndex(items: indexedItems, isCaseSensitive: isCaseSensitive)
-	}
-
-	private static func buildFuseableIndex<U: Fuseable>(from data: [U], isCaseSensitive: Bool) -> FuseIndex<U> {
-		let indexedItems = data.enumerated().map { idx, item in
-			var properties = [String: FuseIndex<U>.IndexedProperty]()
-			for (key, property) in item.fuseProperties {
-				let normalized = isCaseSensitive ? property.value : property.value.lowercased()
-				let characters = Array(normalized)
-				properties[key] = FuseIndex<U>.IndexedProperty(
-					original: property.value,
-					normalized: normalized,
-					characters: characters,
-					characterSet: Set(characters),
-					weight: property.weight,
-					length: characters.count
-				)
-			}
-			return FuseIndex<U>.IndexedItem(
-				item: item,
-				index: idx,
-				properties: properties
-			)
-		}
-		return FuseIndex(items: indexedItems, isCaseSensitive: isCaseSensitive)
-	}
-
-	// MARK: - Instance Search Methods
-
-	/// Searches for a pattern in the indexed dataset.
-	///
-	/// If the index is still being built, this method will wait until it's ready.
-	///
-	///     let fuse = Fuse(data: books)  // Returns immediately
-	///     let results = try await fuse.search("tolkien")  // Waits for index if needed
-	///
-	/// - Parameters:
-	///   - text: The pattern string to search for
-	///   - maxResults: Optional limit on number of results returned
-	/// - Returns: An array of `SearchResult` sorted by score (best matches first)
-	public func search(_ text: String, maxResults: Int? = nil) async throws -> [SearchResult] where T == String {
-		let index = await indexManager.getIndex()
-
-		let pattern = createPattern(from: text)
-		var items = [SearchResult]()
-
-		for indexedItem in index.items {
-			try Task.checkCancellation()
-			if let result = searchIndexed(pattern, in: indexedItem.properties[""]!) {
-				items.append(SearchResult(
-					item: indexedItem.item,
-					index: indexedItem.index,
-					score: result.score,
-					results: ["": result]
-				))
-			}
-		}
-
-		let sorted = items.sorted { $0.score < $1.score }
-		return maxResults.map { Array(sorted.prefix($0)) } ?? sorted
-	}
-
-	/// Searches for a pattern in the indexed dataset.
-	///
-	/// If the index is still being built, this method will wait until it's ready.
-	///
-	///     let fuse = Fuse(data: books)  // Returns immediately
-	///     let results = try await fuse.search("tolkien")  // Waits for index if needed
-	///
-	/// - Parameters:
-	///   - text: The pattern string to search for
-	///   - maxResults: Optional limit on number of results returned
-	/// - Returns: An array of `SearchResult` sorted by score (best matches first)
-	public func search(_ text: String, maxResults: Int? = nil) async throws -> [SearchResult] where T: Fuseable {
-		let index = await indexManager.getIndex()
-
-		try Task.checkCancellation()
-		let pattern = createPattern(from: text)
-
-		var collectionResult = [SearchResult]()
-
-		for indexedItem in index.items {
-			try Task.checkCancellation()
-			var scores = [Double]()
-			var totalScore = 0.0
-			var propertyResults = [String: ResultItem]()
-
-			for (key, property) in indexedItem.properties {
-				if let result = searchIndexed(pattern, in: property) {
-					let weight = property.weight == 1 ? 1 : 1 - property.weight
-					let score = (result.score == 0 && weight == 1 ? 0.001 : result.score) * weight
-					totalScore += score
-					scores.append(score)
-					propertyResults[key] = ResultItem(score: score, ranges: result.ranges)
-				}
-			}
-
-			guard !scores.isEmpty else {
-				continue
-			}
-
-			collectionResult.append(SearchResult(
-				item: indexedItem.item,
-				index: indexedItem.index,
-				score: totalScore / Double(scores.count),
-				results: propertyResults
-			))
-		}
-
-		let sorted = collectionResult.sorted { $0.score < $1.score }
-		return maxResults.map { Array(sorted.prefix($0)) } ?? sorted
-	}
-
-	// MARK: - Pattern Creation
-
-	/// Creates a pattern tuple for searching.
-	///
-	/// - Parameter aString: A string from which to create the pattern tuple
-	/// - Returns: A tuple containing pattern metadata
-	public func createPattern(from aString: String) -> Pattern? {
-		let pattern = String((isCaseSensitive ? aString : aString.lowercased()).prefix(Int.bitWidth - 1))
-		let len = pattern.count
-
-		if len == 0 {
-			return nil
-		}
-
-		return (
-			text: pattern,
-			len: len,
-			mask: 1 << (len - 1),
-			alphabet: Utilities.calculatePatternAlphabet(pattern)
-		)
-	}
-
-	// MARK: - Private Search Implementation
-
-	/// Searches using pre-normalized indexed property data
-	private func searchIndexed<U>(_ pattern: Pattern?, in property: FuseIndex<U>.IndexedProperty) -> ResultItem? {
-		guard let pattern = pattern else {
-			return nil
-		}
-
-		// Pre-filter: check if text contains enough pattern characters to possibly match
-		// If fewer than half the pattern characters exist in the text, skip expensive search
-		let patternChars = Set(pattern.text)
-		let matchingChars = patternChars.intersection(property.characterSet)
-		let minRequiredChars = max(1, patternChars.count / 2)
-		if matchingChars.count < minRequiredChars {
-			return nil
-		}
-
-		if tokenize {
-			let wordPatterns = pattern.text.split(separator: " ").compactMap { createPattern(from: String($0)) }
-			let fullPatternResult = _search(pattern, in: property.original, characters: property.characters, textLength: property.length)
-
-			let results = wordPatterns.reduce(into: fullPatternResult) { totalResult, wordPattern in
-				let result = _search(wordPattern, in: property.original, characters: property.characters, textLength: property.length)
-				totalResult = ResultItem(score: totalResult.score + result.score, ranges: totalResult.ranges + result.ranges)
-			}
-
-			let averagedResult = ResultItem(
-				score: results.score / Double(wordPatterns.count + 1),
-				ranges: Array(Set(results.ranges))
-			)
-			return averagedResult.score == 1 ? nil : averagedResult
-		} else {
-			let result = _search(pattern, in: property.original, characters: property.characters, textLength: property.length)
-			return result.score == 1 ? nil : result
-		}
-	}
-
-	/// Core Bitap algorithm implementation with O(1) character access
-	private func _search(_ pattern: Pattern, in originalString: String, characters: [Character], textLength: Int) -> ResultItem {
-
-		// Create normalized string for substring search (used only for exact match finding)
-		let normalizedText = String(characters)
-
-		// Exact match
-		if pattern.text == normalizedText {
-			return ResultItem(score: 0, ranges: [originalString.startIndex ..< originalString.endIndex])
-		}
-
-		let location = self.location
-		let distance = self.distance
-		var threshold = self.threshold
-
-		var bestLocation: Int? = {
-			if let index = normalizedText.index(of: pattern.text, startingFrom: location) {
-				return normalizedText.distance(from: normalizedText.startIndex, to: index)
-			}
-			return nil
-		}()
-
-		// A mask of the matches
-		var matchMaskArr = [Int](repeating: 0, count: textLength)
-
-		// Get all exact matches for speed up
-		var index = normalizedText.index(of: pattern.text, startingFrom: bestLocation)
-		while index != nil {
-			let i = normalizedText.distance(from: normalizedText.startIndex, to: index!)
-			let score = Utilities.calculateScore(pattern.len, e: 0, x: i, loc: location, distance: distance, ignoreLocation: ignoreLocation)
-			threshold = min(threshold, score)
-			bestLocation = i + pattern.len
-			index = normalizedText.index(of: pattern.text, startingFrom: bestLocation)
-
-			var idx = 0
-			while idx < pattern.len {
-				matchMaskArr[i + idx] = 1
-				idx += 1
-			}
-		}
-
-		// Reset the best location
-		bestLocation = nil
-
-		var score = 1.0
-		var binMax: Int = pattern.len + textLength
-		var lastBitArr = [Int]()
-
-		// Bitap algorithm
-		for i in 0..<pattern.len {
-			var binMin = 0
-			var binMid = binMax
-
-			while binMin < binMid {
-				if Utilities.calculateScore(pattern.len, e: i, x: location, loc: location + binMid, distance: distance, ignoreLocation: ignoreLocation) <= threshold {
-					binMin = binMid
-				} else {
-					binMax = binMid
-				}
-				binMid = ((binMax - binMin) / 2) + binMin
-			}
-
-			binMax = binMid
-			var start = max(1, location - binMid + 1)
-			let finish = min(location + binMid, textLength) + pattern.len
-
-			var bitArr = [Int](repeating: 0, count: finish + 2)
-			bitArr[finish + 1] = (1 << i) - 1
-
-			if start > finish {
-				continue
-			}
-
-			// O(1) character access using array instead of String.Index traversal
-			for j in (start...finish).reversed() {
-				let currentLocation = j - 1
-
-				let charMatch: Int = {
-					if currentLocation < textLength {
-						let char = characters[currentLocation]
-						if let result = pattern.alphabet[char] {
-							return result
-						}
-					}
-					return 0
-				}()
-
-				if charMatch != 0 {
-					matchMaskArr[currentLocation] = 1
-				}
-
-				bitArr[j] = ((bitArr[j + 1] << 1) | 1) & charMatch
-
-				if i > 0 {
-					bitArr[j] |= (((lastBitArr[j + 1] | lastBitArr[j]) << 1) | 1) | lastBitArr[j + 1]
-				}
-
-				if (bitArr[j] & pattern.mask) != 0 {
-					score = Utilities.calculateScore(pattern.len, e: i, x: location, loc: currentLocation, distance: distance, ignoreLocation: ignoreLocation)
-
-					if score <= threshold {
-						threshold = score
-						bestLocation = currentLocation
-
-						guard let bestLocation = bestLocation else {
-							break
-						}
-
-						if bestLocation > location {
-							start = max(1, 2 * location - bestLocation)
-						} else {
-							break
-						}
-					}
-				}
-			}
-
-			if Utilities.calculateScore(pattern.len, e: i + 1, x: location, loc: location, distance: distance, ignoreLocation: ignoreLocation) > threshold {
-				break
-			}
-
-			lastBitArr = bitArr
-		}
-
-		let ranges = Utilities.findRanges(matchMaskArr)
-
-		return ResultItem(score: score, ranges: ranges.map { originalString.range(from: $0) })
-	}
+// MARK: - Convenience initialisers
+
+extension Fuse where Item == String {
+    /// Creates a search over plain strings.
+    public convenience init(_ items: [String], options: FuseOptions = .default, indexing: IndexingStrategy = .lazy) {
+        self.init(items, keys: [], options: options, indexing: indexing, stringValue: { $0 })
+    }
 }
 
-// MARK: - Static Search Methods
+extension Fuse where Item: FuseSearchable {
+    /// Creates a search over items that declare their own ``FuseSearchable/fuseKeys``.
+    public convenience init(_ items: [Item], options: FuseOptions = .default, indexing: IndexingStrategy = .lazy) {
+        self.init(items, keys: Item.fuseKeys, options: options, indexing: indexing)
+    }
+}
+
+// MARK: - One-off searches
 
 extension Fuse {
+    /// Searches `items` once without keeping an index around.
+    public static func search(_ pattern: String, in items: [Item], keys: [FuseKey<Item>], options: FuseOptions = .default, limit: Int? = nil) -> [FuseResult<Item>] {
+        Fuse(items, keys: keys, options: options).search(pattern, limit: limit)
+    }
 
-	/// Performs a one-time fuzzy search on an array of strings.
-	///
-	/// Use this for single searches where you don't need to reuse the index.
-	/// For repeated searches on the same data, create a `Fuse` instance instead.
-	///
-	///     let results = try await Fuse.search("john", in: names)
-	///
-	/// - Parameters:
-	///   - text: The pattern string to search for
-	///   - data: The array of strings to search
-	///   - maxResults: Optional limit on number of results returned
-	///   - location: Approximately where in the text is the pattern expected to be found. Defaults to `0`
-	///   - distance: Determines how close the match must be to the fuzzy `location`. Defaults to `100`
-	///   - threshold: At what point does the match algorithm give up. Defaults to `0.6`
-	///   - isCaseSensitive: Indicates whether comparisons should be case sensitive. Defaults to `false`
-	///   - tokenize: When true, searches individual words and the full string. Defaults to `false`
-	///   - ignoreLocation: When true, score is based only on match accuracy. Defaults to `false`
-	/// - Returns: An array of `SearchResult` sorted by score (best matches first)
-	public static func search(
-		_ text: String,
-		in data: [String],
-		maxResults: Int? = nil,
-		location: Int = 0,
-		distance: Int = 100,
-		threshold: Double = 0.6,
-		isCaseSensitive: Bool = false,
-		tokenize: Bool = false,
-		ignoreLocation: Bool = false
-	) async throws -> [Fuse<String>.SearchResult] {
-		let fuse = Fuse<String>(
-			data: data,
-			location: location,
-			distance: distance,
-			threshold: threshold,
-			isCaseSensitive: isCaseSensitive,
-			tokenize: tokenize,
-			ignoreLocation: ignoreLocation
-		)
-		return try await fuse.search(text, maxResults: maxResults)
-	}
+    /// Searches `items` once without keeping an index around.
+    public static func search(_ pattern: String, in items: [Item], keys: [FuseKey<Item>], options: FuseOptions = .default, limit: Int? = nil) async throws -> [FuseResult<Item>] {
+        try await Fuse(items, keys: keys, options: options).search(pattern, limit: limit)
+    }
+}
 
-	/// Performs a one-time fuzzy search on an array of `Fuseable` objects.
-	///
-	/// Use this for single searches where you don't need to reuse the index.
-	/// For repeated searches on the same data, create a `Fuse` instance instead.
-	///
-	///     let results = try await Fuse.search("tolkien", in: books)
-	///
-	/// - Parameters:
-	///   - text: The pattern string to search for
-	///   - data: The array of `Fuseable` objects to search
-	///   - maxResults: Optional limit on number of results returned
-	///   - location: Approximately where in the text is the pattern expected to be found. Defaults to `0`
-	///   - distance: Determines how close the match must be to the fuzzy `location`. Defaults to `100`
-	///   - threshold: At what point does the match algorithm give up. Defaults to `0.6`
-	///   - isCaseSensitive: Indicates whether comparisons should be case sensitive. Defaults to `false`
-	///   - tokenize: When true, searches individual words and the full string. Defaults to `false`
-	///   - ignoreLocation: When true, score is based only on match accuracy. Defaults to `false`
-	/// - Returns: An array of `SearchResult` sorted by score (best matches first)
-	public static func search<U: Fuseable & Sendable>(
-		_ text: String,
-		in data: [U],
-		maxResults: Int? = nil,
-		location: Int = 0,
-		distance: Int = 100,
-		threshold: Double = 0.6,
-		isCaseSensitive: Bool = false,
-		tokenize: Bool = false,
-		ignoreLocation: Bool = false
-	) async throws -> [Fuse<U>.SearchResult] {
-		let fuse = Fuse<U>(
-			data: data,
-			location: location,
-			distance: distance,
-			threshold: threshold,
-			isCaseSensitive: isCaseSensitive,
-			tokenize: tokenize,
-			ignoreLocation: ignoreLocation
-		)
-		return try await fuse.search(text, maxResults: maxResults)
-	}
+extension Fuse where Item == String {
+    /// Searches strings once without keeping an index around.
+    public static func search(_ pattern: String, in items: [String], options: FuseOptions = .default, limit: Int? = nil) -> [FuseResult<String>] {
+        Fuse(items, options: options).search(pattern, limit: limit)
+    }
+
+    /// Searches strings once without keeping an index around.
+    public static func search(_ pattern: String, in items: [String], options: FuseOptions = .default, limit: Int? = nil) async throws -> [FuseResult<String>] {
+        try await Fuse(items, options: options).search(pattern, limit: limit)
+    }
+}
+
+extension Fuse where Item: FuseSearchable {
+    /// Searches items once without keeping an index around.
+    public static func search(_ pattern: String, in items: [Item], options: FuseOptions = .default, limit: Int? = nil) -> [FuseResult<Item>] {
+        Fuse(items, options: options).search(pattern, limit: limit)
+    }
+
+    /// Searches items once without keeping an index around.
+    public static func search(_ pattern: String, in items: [Item], options: FuseOptions = .default, limit: Int? = nil) async throws -> [FuseResult<Item>] {
+        try await Fuse(items, options: options).search(pattern, limit: limit)
+    }
 }

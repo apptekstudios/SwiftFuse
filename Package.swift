@@ -1,27 +1,35 @@
-// swift-tools-version: 5.9
-// The swift-tools-version declares the minimum version of Swift required to build this package.
-
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
     name: "Fuse",
-	platforms: [
-		.macOS(.v10_15),
-		.iOS(.v15)
-	],
+    platforms: [
+        .macOS(.v12),
+        .iOS(.v15),
+        .tvOS(.v15),
+        .watchOS(.v8),
+        .visionOS(.v1),
+    ],
     products: [
-        // Products define the executables and libraries a package produces, making them visible to other packages.
-        .library(
-            name: "Fuse",
-            targets: ["Fuse"]),
+        .library(name: "Fuse", targets: ["Fuse"]),
     ],
     targets: [
-        // Targets are the basic building blocks of a package, defining a module or a test suite.
-        // Targets can depend on other targets in this package and products from dependencies.
         .target(
-            name: "Fuse"),
+            name: "Fuse",
+            swiftSettings: [
+                .enableUpcomingFeature("ExistentialAny"),
+            ]
+        ),
+        .executableTarget(
+            name: "fuse-benchmark",
+            dependencies: ["Fuse"],
+            path: "Sources/FuseBenchmark"
+        ),
         .testTarget(
             name: "FuseTests",
-            dependencies: ["Fuse"]),
-    ]
+            dependencies: ["Fuse"],
+            resources: [.copy("Fixtures")]
+        ),
+    ],
+    swiftLanguageModes: [.v6]
 )

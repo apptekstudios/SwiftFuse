@@ -2,16 +2,13 @@ import Fuse
 
 let names = ["John Smith", "Jane Doe", "Bob Wilson", "Alice Johnson"]
 
-// Create a Fuse instance -- returns immediately, indexes in background
-let fuse = Fuse(data: names)
+// Creating a Fuse is free; the index is built on the first search and reused after that.
+let fuse = Fuse(names)
 
-// Search awaits the index if still building
-let results = try await fuse.search("john")
-
-for result in results {
-    print("\(result.item) (score: \(result.score))")
+for result in fuse.search("john") {
+    print("\(result.item) — score \(result.score)")
 }
 
-// One-time static search (no instance needed)
-let staticResults = try await Fuse<String>.search("john", in: names)
-print("Static search found \(staticResults.count) results")
+// One-off search without keeping an instance around:
+let topTwo = Fuse.search("jon", in: names, limit: 2)
+print(topTwo.map(\.item))
