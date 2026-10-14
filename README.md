@@ -358,22 +358,6 @@ that `swift build` compiles, so the examples cannot go stale. Run one with
 - Logical queries work with token search (Fuse.js 7.5 throws).
 - Everything is `Sendable` and there is an `async` search; Fuse.js is single-threaded.
 
-## Migrating from the pre-1.0 API
-
-| Before | 1.0 |
-|---|---|
-| `Fuse(data: items, threshold: 0.4, …)` | `Fuse(items, options: FuseOptions(threshold: 0.4, …))` |
-| `try await fuse.search("x")` (always async) | `fuse.search("x")` or `try await fuse.search("x")` |
-| `Fuse<String>.search("x", in: items, …)` | `Fuse.search("x", in: items, options: …)` |
-| `Fuseable` with `fuseProperties: [String: FuseProperty]` | `FuseSearchable` with `static let fuseKeys: [FuseKey<Self>]` |
-| `FuseProperty(value:, weight:)` — *lower* weight = more important | `FuseKey(name, weight:, …)` — *higher* weight = more important (as in Fuse.js) |
-| `result.index`, `result.results[key].ranges` | `result.refIndex`, `result.matches[i].ranges` (needs `includeMatches`) |
-| `tokenize: true` | `useTokenSearch: true` |
-| `maxPatternLength` | removed — long patterns are chunked like Fuse.js |
-
-Scores are not comparable with the pre-1.0 implementation, which averaged per-property scores;
-1.0 uses the Fuse.js product with field-length norm.
-
 ## License
 
 MIT
