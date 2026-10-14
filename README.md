@@ -42,7 +42,7 @@ fuse.search("old man").first?.item.title   // "Old Man's War"
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/apptekstudios/SwiftFuse.git", from: "2.0.0"),
+    .package(url: "https://github.com/apptekstudios/SwiftFuse.git", from: "1.0.0"),
 ],
 targets: [
     .target(name: "YourTarget", dependencies: [.product(name: "Fuse", package: "SwiftFuse")]),
@@ -358,9 +358,9 @@ that `swift build` compiles, so the examples cannot go stale. Run one with
 - Logical queries work with token search (Fuse.js 7.5 throws).
 - Everything is `Sendable` and there is an `async` search; Fuse.js is single-threaded.
 
-## Migrating from SwiftFuse 1.x
+## Migrating from the pre-1.0 API
 
-| 1.x | 2.x |
+| Before | 1.0 |
 |---|---|
 | `Fuse(data: items, threshold: 0.4, …)` | `Fuse(items, options: FuseOptions(threshold: 0.4, …))` |
 | `try await fuse.search("x")` (always async) | `fuse.search("x")` or `try await fuse.search("x")` |
@@ -371,8 +371,8 @@ that `swift build` compiles, so the examples cannot go stale. Run one with
 | `tokenize: true` | `useTokenSearch: true` |
 | `maxPatternLength` | removed — long patterns are chunked like Fuse.js |
 
-Scores are not comparable between 1.x and 2.x: 1.x averaged per-property scores, 2.x uses the
-Fuse.js product with field-length norm.
+Scores are not comparable with the pre-1.0 implementation, which averaged per-property scores;
+1.0 uses the Fuse.js product with field-length norm.
 
 ## License
 
